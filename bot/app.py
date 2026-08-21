@@ -17,6 +17,8 @@ import functools
 import logging
 import os
 import sys
+import threading
+import time
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -24,6 +26,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import classifier  # noqa: E402
+import daily  # noqa: E402
 import filters  # noqa: E402
 import jira  # noqa: E402
 import store  # noqa: E402
@@ -38,6 +41,13 @@ WATCH = {c.strip() for c in os.environ.get("WATCH_CHANNELS", "").split(",") if c
 DIGEST = {c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()}
 MARKER = os.environ.get("MARKER_EMOJI", "robot_face")
 AUTO_REPLY_ON_MENTION = os.environ.get("AUTO_REPLY_ON_MENTION", "false").lower() == "true"
+# Сколько часов истории добрать при старте. Slack не переигрывает пропущенные
+# события: всё, что произошло, пока процесс лежал, для него не существует.
+# Добор при старте — единственное, что закрывает эту дыру.
+BACKFILL_HOURS = int(os.environ.get("BACKFILL_HOURS", "24"))
+# Время ежедневной сводки, ЧЧ:ММ по локальному времени хоста.
+DIGEST_AT = os.environ.get("DIGEST_AT", "09:30")
+DRAFT_EXPIRY_HOURS = float(os.environ.get("DRAFT_EXPIRY_HOURS", "24"))
 PREFIX = ":robot_face: *Глебот* (AI-помощник Глеба):"
 
 # Не влезать в тред, где разговор уже идёт своим ходом.
@@ -58,9 +68,6 @@ def bot_user_id() -> str:
     """
     return app.client.auth_test()["user_id"]
 
-APPROVE_WORDS = {"ок", "ok", "да", "+", "го", "давай", "запость"}
-TICKET_WORDS = {"ок+жира", "ок+jira", "+тикет", "ok+jira", "+жира"}
-REJECT_WORDS = {"нет", "не надо", "skip", "no", "отмена", "-"}
 
 # --------------------------------------------------------------------------
 # вспомогательное
@@ -181,16 +188,24 @@ def publish(draft, *, with_ticket: bool) -> str:
 
 @app.event("message")
 def on_message(event):
-    channel = event.get("channel")
-
     # Личка владельца — это инбокс: там решения по карточкам, не разбор.
     if event.get("channel_type") == "im":
         handle_inbox(event)
         return
+    process_channel_message(event)
+
+
+def process_channel_message(event: dict) -> None:
+    """Разобрать одно сообщение канала.
+
+    Отдельно от обработчика события, потому что тот же путь проходят
+    сообщения, добранные из истории при старте: событие и запись в истории
+    отличаются только источником, а решения по ним должны быть одинаковыми.
+    """
+    channel = event.get("channel")
 
     if channel not in WATCH:
-        # DIGEST-каналы бот не обслуживает: сводки по ним остаются
-        # за часовым обходом, которому не нужен постоянный процесс.
+        # DIGEST-каналы в тред не обслуживаются — они попадают в сводку.
         return
     if not filters.worth_classifying(event, owner_id=OWNER, bot_id=bot_user_id()):
         return
@@ -274,48 +289,115 @@ def on_message(event):
     )
 
 
+def resolve_target(decision: dict, channel: str, thread_ts: str | None):
+    """К какой карточке относится ответ владельца.
+
+    Возвращает ``(draft, ambiguous, matched_by_id)``. ``ambiguous`` — список
+    ждущих карточек, когда понять однозначно нельзя.
+
+    Порядок проб идёт от самого надёжного к самому удобному. В личке с самим
+    собой естественнее всего просто напечатать «ок», а не искать «ответить
+    в треде», — и это должно работать. Но угадывать адресата, когда карточек
+    несколько, нельзя: ценой ошибки будет чужой ответ в рабочем канале.
+    """
+    # 1. Ответ в треде карточки — адресат назван самим Slack.
+    if thread_ts:
+        draft = store.by_card(channel, thread_ts)
+        if draft is not None:
+            return draft, None, False
+
+    # 2. Владелец назвал идентификатор сам.
+    if decision["draft_id"]:
+        draft = store.by_id_prefix(decision["draft_id"])
+        if draft is not None:
+            return draft, None, True
+
+    # 3. Ждёт ровно одна карточка — двусмысленности нет.
+    pending = store.awaiting()
+    if len(pending) == 1:
+        return pending[0], None, False
+    if not pending:
+        return None, None, False
+
+    return None, pending, False
+
+
+def describe(draft) -> str:
+    excerpt = (draft["src_excerpt"] or "").replace("\n", " ")[:80]
+    return f"`{draft['id']}` · {draft['cls']} · «{excerpt}…»"
+
+
 def handle_inbox(event: dict) -> None:
     """Ответ владельца в личке: решение по карточке или правка."""
     if event.get("user") != OWNER:
         return
 
+    text = (event.get("text") or "").strip()
+    if not text:
+        return
+
     thread_ts = event.get("thread_ts")
-    if not thread_ts:
-        return  # реплика не в треде карточки — не наше дело
+    decision = filters.parse_decision(text)
+    draft, ambiguous, matched_by_id = resolve_target(
+        decision, event["channel"], thread_ts
+    )
 
-    draft = store.by_card(event["channel"], thread_ts)
-    if draft is None or draft["status"] != "awaiting":
+    # Куда отвечать: если владелец писал в тред — туда же, иначе обычным
+    # сообщением, чтобы ответ не спрятался в свёрнутом треде.
+    def respond(message: str) -> None:
+        if thread_ts:
+            app.client.chat_postMessage(
+                channel=event["channel"], thread_ts=thread_ts, text=message
+            )
+        else:
+            app.client.chat_postMessage(channel=event["channel"], text=message)
+
+    if ambiguous:
+        listing = "\n".join(f"• {describe(d)}" for d in ambiguous)
+        respond(
+            f"Решения ждут {len(ambiguous)} карточки — не понял, про какую речь.\n"
+            f"{listing}\n\nНапиши идентификатор перед ответом, например "
+            f"`{ambiguous[0]['id']} ок`, или ответь реакцией прямо на карточку."
+        )
         return
 
-    answer = (event.get("text") or "").strip().lower()
+    if draft is None:
+        return  # ничего не ждёт решения — это просто заметка себе
 
-    if answer in REJECT_WORDS:
+    if draft["status"] != "awaiting":
+        respond(f"Карточка `{draft['id']}` уже закрыта: {draft['status']}.")
+        return
+
+    if decision["action"] == "unclear":
+        respond(
+            f"{describe(draft)}\nЧто с ней делать — «ок», «нет» или текст правки?"
+        )
+        return
+
+    if decision["action"] == "reject":
         store.resolve(draft["id"], "dropped")
-        reply_in_card(event["channel"], thread_ts, "Отменил, в канал ничего не ушло.")
+        respond(f"Отменил `{draft['id']}`, в канал ничего не ушло.")
         return
 
-    if answer in TICKET_WORDS:
-        reply_in_card(event["channel"], thread_ts, publish(draft, with_ticket=True))
+    if decision["action"] in ("approve", "ticket"):
+        respond(publish(draft, with_ticket=decision["action"] == "ticket"))
         return
 
-    if answer in APPROVE_WORDS:
-        reply_in_card(event["channel"], thread_ts, publish(draft, with_ticket=False))
-        return
-
-    # Всё остальное — правка. Переписываем ответ по сказанному и
-    # присылаем новую карточку, не споря: владелец видит канал целиком.
+    # Всё остальное — правка. Переписываем по сказанному и присылаем новую
+    # карточку, не споря: владелец видит канал целиком, а бот — нет.
+    instruction = decision["text"] if matched_by_id else decision["original"]
     try:
         verdict = classifier.classify(
-            text=draft["src_excerpt"],
+            text=draft["src_excerpt"] or "",
             author=draft["src_author"] or "?",
             channel_name=channel_name(draft["src_channel"]),
             owner_mentioned=True,
             thread_replies=0,
-            thread_excerpt=f"Владелец просит переписать ответ так: {event['text']}",
+            thread_excerpt=f"Владелец просит переписать ответ так: {instruction}",
         )
     except Exception:
         log.exception("revise")
-        reply_in_card(event["channel"], thread_ts, "Не смог переписать — попробуй ещё раз.")
+        respond("Не смог переписать — попробуй ещё раз.")
         return
 
     store.update_reply(draft["id"], verdict["reply"])
@@ -369,12 +451,77 @@ def on_app_mention(event, say):
     )
 
 
+def has_marker(message: dict) -> bool:
+    """Стоит ли на сообщении наша метка «разобрано»."""
+    return any(
+        reaction.get("name") == MARKER
+        for reaction in message.get("reactions", [])
+    )
+
+
+def backfill() -> None:
+    """Разобрать историю, накопившуюся, пока процесс не работал.
+
+    Событий Slack за время простоя не будет никогда — их не переигрывают.
+    Поэтому при каждом старте бот прочитывает недавнюю историю сам и
+    пропускает всё, что уже помечено. Без этого любой деплой означал бы
+    навсегда потерянный кусок канала.
+    """
+    oldest = str(int(time.time()) - BACKFILL_HOURS * 3600)
+    for channel in sorted(WATCH):
+        try:
+            history = app.client.conversations_history(
+                channel=channel, oldest=oldest, limit=50
+            )["messages"]
+        except Exception:
+            log.exception("добор истории %s", channel)
+            continue
+
+        # Slack отдаёт новые первыми, а разбирать надо в порядке разговора.
+        for message in reversed(history):
+            if has_marker(message):
+                continue
+            process_channel_message({**message, "channel": channel})
+
+    log.info("добор истории за %s ч завершён", BACKFILL_HOURS)
+
+
+def scheduler() -> None:
+    """Будильник для ежедневной сводки и отмены протухших карточек."""
+    last_run_date = None
+    while True:
+        try:
+            now = time.localtime()
+            stamp = f"{now.tm_hour:02d}:{now.tm_min:02d}"
+            today = time.strftime("%Y-%m-%d", now)
+            if stamp == DIGEST_AT and last_run_date != today:
+                last_run_date = today
+                daily.run(
+                    app.client,
+                    inbox=OWNER,
+                    digest_channels={c: channel_name(c) for c in sorted(DIGEST)},
+                    owner_id=OWNER,
+                    bot_id=bot_user_id(),
+                    expiry_hours=DRAFT_EXPIRY_HOURS,
+                )
+        except Exception:
+            log.exception("будильник")
+        time.sleep(30)
+
+
 if __name__ == "__main__":
     store.init()
     log.info(
-        "Глебот стартует · модель %s · каналы %s · авто-ответ на теги: %s",
+        "Глебот стартует · модель %s · каналы %s · авто-ответ на теги: %s · "
+        "сводка в %s · добор %s ч",
         classifier.MODEL,
         ", ".join(sorted(WATCH)) or "не заданы",
         AUTO_REPLY_ON_MENTION,
+        DIGEST_AT,
+        BACKFILL_HOURS,
     )
+
+    backfill()
+    threading.Thread(target=scheduler, daemon=True, name="glebot-scheduler").start()
+
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()

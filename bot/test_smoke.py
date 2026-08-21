@@ -101,6 +101,79 @@ def test_prefilter():
     ok(f"{len(cases)} случаев разобраны верно")
 
 
+def test_decisions():
+    """Разбор ответа владельца — свободная форма, а не строгий синтаксис."""
+    cases = [
+        ("ок", "approve", None),
+        ("ОК", "approve", None),
+        ("да", "approve", None),
+        ("+", "approve", None),
+        ("нет", "reject", None),
+        ("отмена", "reject", None),
+        ("ок+жира", "ticket", None),
+        ("7c1a ок", "approve", "7c1a"),
+        ("`7c1a` нет", "reject", "7c1a"),
+        ("7c1a", "unclear", "7c1a"),
+        ("убери первое предложение", "revise", None),
+    ]
+    for text, action, draft_id in cases:
+        got = filters.parse_decision(text)
+        assert got["action"] == action, f"{text!r}: ждали {action}, получили {got['action']}"
+        assert got["draft_id"] == draft_id, f"{text!r}: id {got['draft_id']}"
+    ok(f"{len(cases)} формулировок разобраны верно")
+
+    # Слово из hex-букв не должно съедаться как номер карточки: полный текст
+    # сохраняется, и вызывающий код откатится к нему, не найдя такой черновик.
+    parsed = filters.parse_decision("abc сделай короче")
+    assert parsed["draft_id"] == "abc"
+    assert parsed["original"] == "abc сделай короче"
+    ok("текст правки не теряет первое слово, даже если оно похоже на номер")
+
+
+def test_draft_lookup():
+    """Поиск карточки по началу номера и защита от неоднозначности."""
+    first = store.create(
+        cls="BUG", confidence="высокая", src_channel="C9", src_ts="5.1",
+        src_thread_ts=None, src_author="a", src_excerpt="первый",
+        reply_text="r", jira_summary="",
+    )
+    assert store.by_id_prefix(first)["id"] == first
+    assert store.by_id_prefix(first[:2])["id"] == first
+    assert store.by_id_prefix(first.upper())["id"] == first
+    assert store.by_id_prefix("zzzz") is None
+    assert len(store.awaiting()) == 1
+    ok("поиск по префиксу и регистру, список ждущих")
+
+    store.resolve(first, "dropped")
+    assert store.awaiting() == []
+    assert store.by_id_prefix(first) is None, "закрытая карточка не должна находиться"
+    ok("закрытая карточка выпадает из поиска")
+
+
+def test_expiry():
+    """Просроченные карточки отменяются, свежие — нет."""
+    import time as _time
+    fresh = store.create(
+        cls="BUG", confidence="высокая", src_channel="C9", src_ts="6.1",
+        src_thread_ts=None, src_author="a", src_excerpt="свежий",
+        reply_text="r", jira_summary="",
+    )
+    stale = store.create(
+        cls="BUG", confidence="высокая", src_channel="C9", src_ts="6.2",
+        src_thread_ts=None, src_author="a", src_excerpt="протухший",
+        reply_text="r", jira_summary="",
+    )
+    with store._connect() as conn:
+        conn.execute("UPDATE drafts SET created_at = ? WHERE id = ?",
+                     (_time.time() - 40 * 3600, stale))
+
+    expired = store.expire_older_than(24)
+    assert [row["id"] for row in expired] == [stale], expired
+    assert store.by_id(stale)["status"] == "expired"
+    assert store.by_id(fresh)["status"] == "awaiting"
+    ok("протухшая отменена, свежая не тронута")
+
+
 def test_card():
     card = filters.card_text(
         "a1b2",
@@ -132,6 +205,9 @@ if __name__ == "__main__":
         ("хранилище черновиков", test_store),
         ("jira без настройки", test_jira_optional),
         ("рубрика классификатора", test_rubric),
+        ("разбор решений владельца", test_decisions),
+        ("поиск карточки", test_draft_lookup),
+        ("отмена просроченных", test_expiry),
         ("дешёвый фильтр", test_prefilter),
         ("карточка черновика", test_card),
     ]:

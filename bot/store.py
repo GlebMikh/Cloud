@@ -115,6 +115,33 @@ def by_id(draft_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def awaiting() -> list[sqlite3.Row]:
+    """Черновики, ждущие решения, — новые первыми."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM drafts WHERE status = 'awaiting' ORDER BY created_at DESC"
+        ).fetchall()
+
+
+def by_id_prefix(prefix: str) -> sqlite3.Row | None:
+    """Найти черновик по началу идентификатора.
+
+    Владелец печатает id с телефона и вполне может ошибиться регистром или
+    оборвать его на середине, поэтому ищем по префиксу, а не по точному
+    совпадению. Неоднозначный префикс считаем ненайденным: лучше переспросить,
+    чем запостить не тот ответ в рабочий канал.
+    """
+    prefix = prefix.strip().lower()
+    if not prefix:
+        return None
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM drafts WHERE id LIKE ? AND status = 'awaiting'",
+            (prefix + "%",),
+        ).fetchall()
+    return rows[0] if len(rows) == 1 else None
+
+
 def resolve(draft_id: str, status: str, jira_key: str | None = None) -> None:
     with _connect() as conn:
         conn.execute(
