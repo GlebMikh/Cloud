@@ -1,0 +1,10 @@
+{
+  "_note": "Курсор последнего разобранного сообщения по каждому каналу. Slack ts. null = первый запуск, агент возьмёт час назад и не полезет в историю.",
+  "last_cycle_at": null,
+  "channels": {
+    "C099240QR3N": null,
+    "C099GHLHAJV": null,
+    "C0AU59E1N9H": null
+  },
+  "greeted_channels": []
+}
