@@ -1,0 +1,52 @@
+# Манифест Slack-приложения. Не редактируется руками в UI:
+# api.slack.com/apps → Create New App → From an app manifest → вставить целиком.
+# Пересоздание приложения из этого файла даёт ровно тот же набор прав,
+# поэтому его стоит держать в репозитории, а не в браузере.
+display_information:
+  name: Глебот
+  description: AI-помощник Глеба — следит, чтобы баги и вопросы не терялись в потоке
+  background_color: "#2b3a4a"
+  long_description: "Читает каналы разработки, отличает баги и задачи от обсуждений и приносит Глебу готовый черновик ответа на подтверждение. Сам в канал ничего не пишет без его «ок»."
+
+features:
+  bot_user:
+    display_name: Глебот
+    always_online: true
+  app_home:
+    home_tab_enabled: false
+    # Вкладка сообщений обязана быть включена: через неё бот шлёт
+    # карточки черновиков в личку и принимает решения по ним.
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read      # прямые обращения к самому боту
+      - channels:history       # чтение публичных каналов
+      - channels:read          # имена каналов для карточек
+      - groups:history         # чтение приватных каналов
+      - groups:read
+      - chat:write             # ответы в треды и личка владельцу
+      - im:history             # чтение ответов владельца на карточки
+      - im:write               # отправка карточек в личку
+      - reactions:read         # чтение реакций-одобрений
+      - reactions:write        # метка «разобрано»
+      - users:read             # имена авторов
+      - files:read             # скриншоты в баг-репортах
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - reaction_added
+  interactivity:
+    # Кнопок нет намеренно: решения принимаются реакциями и текстом,
+    # то есть одинаково работают с телефона и с десктопа, и одинаково
+    # выглядят для часового агента, который читает ту же переписку.
+    is_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
