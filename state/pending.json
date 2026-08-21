@@ -1,4 +1,33 @@
 {
   "_note": "Черновики, отправленные владельцу. Статусы: awaiting | posted | dropped | expired | revised. Запись живёт до тех пор, пока не станет posted/dropped/expired, потом чистится через 7 дней.",
-  "drafts": []
+  "drafts": [
+    {
+      "id": "7c1a",
+      "created_at": "2026-08-21T17:13:26+03:00",
+      "status": "awaiting",
+      "revision": 1,
+      "class": "QUESTION",
+      "confidence": "средняя",
+      "source": {
+        "channel_id": "C099240QR3N",
+        "channel_name": "разработка-обсуждение",
+        "message_ts": "1787238147.878099",
+        "thread_ts": "1787238147.878099",
+        "author": "Andrey Sergienko",
+        "permalink": "https://cobaltlabworkspace.slack.com/archives/C099240QR3N/p1787238147878099",
+        "excerpt": "steamApiKey получаем на личные акки. Мб корп акк стима есть?"
+      },
+      "inbox": {
+        "channel_id": "D0BKCHXPVPC",
+        "message_ts": "1787321606.604489"
+      },
+      "reply_text": "Привет! Я Глебот — AI-помощник Глеба, слежу за тем, чтобы вопросы к нему не терялись в потоке. Про корпоративный аккаунт Steam — вопрос к нему, передаю. Как ответит, вернусь в этот тред.",
+      "jira_draft": null,
+      "on_publish": {
+        "_note": "После публикации добавить канал в greeted_channels: ответ содержит представление Глебота, второй раз здороваться не нужно.",
+        "add_greeted_channel": "C099240QR3N"
+      },
+      "resolved_at": null
+    }
+  ]
 }
