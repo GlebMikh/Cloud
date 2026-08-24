@@ -466,24 +466,52 @@ def backfill() -> None:
     Поэтому при каждом старте бот прочитывает недавнюю историю сам и
     пропускает всё, что уже помечено. Без этого любой деплой означал бы
     навсегда потерянный кусок канала.
+
+    История отдаёт только корневые сообщения, и корень датируется своим
+    временем, а не временем последнего ответа. Тред, заведённый неделю
+    назад, в окно не попадёт, даже если ответы в нём писали десять минут
+    назад — а именно в таких тредах и живёт обсуждение разработки. Поэтому
+    окно применяется не к запросу, а к разбору: историю берём целиком, а
+    дальше смотрим на `latest_reply`.
     """
-    oldest = str(int(time.time()) - BACKFILL_HOURS * 3600)
+    oldest = time.time() - BACKFILL_HOURS * 3600
     for channel in sorted(WATCH):
         try:
-            history = app.client.conversations_history(
-                channel=channel, oldest=oldest, limit=50
-            )["messages"]
+            history = app.client.conversations_history(channel=channel, limit=50)[
+                "messages"
+            ]
         except Exception:
             log.exception("добор истории %s", channel)
             continue
 
         # Slack отдаёт новые первыми, а разбирать надо в порядке разговора.
         for message in reversed(history):
-            if has_marker(message):
-                continue
-            process_channel_message({**message, "channel": channel})
+            if float(message.get("ts", 0)) >= oldest and not has_marker(message):
+                process_channel_message({**message, "channel": channel})
+            if float(message.get("latest_reply", 0)) >= oldest:
+                backfill_thread(channel, message["ts"], oldest)
 
     log.info("добор истории за %s ч завершён", BACKFILL_HOURS)
+
+
+def backfill_thread(channel: str, thread_ts: str, oldest: float) -> None:
+    """Разобрать свежие ответы в треде, чей корень уже вне окна."""
+    try:
+        replies = app.client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=100
+        )["messages"]
+    except Exception:
+        log.exception("добор треда %s/%s", channel, thread_ts)
+        return
+
+    for reply in replies:
+        if reply.get("ts") == thread_ts:
+            continue  # корень уже разобран выше или слишком стар
+        if float(reply.get("ts", 0)) < oldest or has_marker(reply):
+            continue
+        process_channel_message(
+            {**reply, "channel": channel, "thread_ts": thread_ts}
+        )
 
 
 def scheduler() -> None:
