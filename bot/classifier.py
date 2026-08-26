@@ -92,7 +92,7 @@ def _rubric() -> str:
     prompt caching на стороне API вообще срабатывал.
     """
     parts = []
-    for name in ("classification.md", "replies.md"):
+    for name in ("context.md", "classification.md", "replies.md"):
         path = REFERENCES / name
         if path.exists():
             parts.append(path.read_text(encoding="utf-8"))
@@ -303,8 +303,16 @@ def parse_verdict(text: str) -> dict:
 
 
 def _context(text, author, channel_name, owner_mentioned, thread_replies,
-             thread_excerpt, owner_replied_in_thread) -> dict:
+             thread_excerpt, owner_replied_in_thread, audience="channel") -> dict:
     context = {
+        # Для кого пишется reply. В тред идёт ответ автору сообщения, в личку —
+        # справка владельцу о том, что происходит без него. Это разные тексты,
+        # и путать их — значит либо писать коллегам служебную записку, либо
+        # владельцу — вежливое «зафиксировал, передам Глебу».
+        "кому адресован ответ": (
+            "в тред канала, автору сообщения" if audience == "channel"
+            else "лично владельцу, в канал ничего не уйдёт"
+        ),
         "канал": channel_name,
         "автор": author,
         "владельца тегнули": owner_mentioned,
@@ -443,6 +451,7 @@ def classify(
     thread_replies: int,
     thread_excerpt: str = "",
     owner_replied_in_thread: bool = False,
+    audience: str = "channel",
 ) -> dict:
     """Вернуть решение по сообщению.
 
@@ -452,6 +461,6 @@ def classify(
     _check_rate()
     context = _context(
         text, author, channel_name, owner_mentioned, thread_replies,
-        thread_excerpt, owner_replied_in_thread,
+        thread_excerpt, owner_replied_in_thread, audience,
     )
     return _classify_api(context) if backend() == "api" else _classify_cli(context)

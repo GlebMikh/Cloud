@@ -152,6 +152,8 @@ def notice_text(
     prefix_emoji: str = ":robot_face:",
     jira_project: str = "",
     jira_issue_type: str = "",
+    mode: str = "posted",
+    thread_excerpt: str = "",
 ) -> str:
     """Сводка о том, что бот уже ответил сам.
 
@@ -161,7 +163,11 @@ def notice_text(
     произошло, что сказано от его имени и как это отменить. Поэтому цитата
     короче, а последняя строка — про отмену, а не про одобрение.
     """
-    head = f"{prefix_emoji} *Ответил сам* `{draft_id}` · {verdict['cls']}"
+    held = mode == "held"
+    head = (
+        f"{prefix_emoji} *{'Не влез в тред' if held else 'Ответил сам'}* "
+        f"`{draft_id}` · {verdict['cls']}"
+    )
     if verdict.get("confidence"):
         head += f" · уверенность: {verdict['confidence']}"
 
@@ -172,20 +178,34 @@ def notice_text(
         head,
         f"*Канал:* #{channel} · *Автор:* {author}{link_part}",
         f"> {quote}",
-        "",
-        f"*Ответил:* {verdict['reply']}",
     ]
+    if held and thread_excerpt:
+        # Кто уже откликнулся — самое ценное в этой сводке: по ней владелец
+        # решает, нужен ли он тут вообще.
+        answers = " · ".join(
+            line.strip()[:90] for line in thread_excerpt.splitlines() if line.strip()
+        )
+        lines.append(f"*В треде уже ответили:* {answers[:300]}")
+    lines += ["", f"*{'Тебе' if held else 'Ответил'}:* {verdict['reply']}"]
     if verdict.get("jira_summary") and jira_project:
         lines += [
             "",
             f"*Черновик тикета:* {jira_project} / {jira_issue_type} / "
             f"«{verdict['jira_summary']}» — заведу по 🎫",
         ]
-    lines += [
-        "",
-        "_❌ — удалить мой ответ из треда · 🎫 — завести тикет · "
-        "любой текст — перепишу отправленное._",
-    ]
+    if held:
+        lines += [
+            "",
+            "_В канал ничего не ушло: там уже отвечают без тебя._",
+            "_✅ — всё же ответить в треде · 🎫 — завести тикет · "
+            "текст — что именно ответить · ❌ — закрыть и забыть._",
+        ]
+    else:
+        lines += [
+            "",
+            "_❌ — удалить мой ответ из треда · 🎫 — завести тикет · "
+            "любой текст — перепишу отправленное._",
+        ]
     return "\n".join(lines)
 
 

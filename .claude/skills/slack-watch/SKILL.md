@@ -18,7 +18,8 @@ description: Один цикл работы Слак-агента «Глебот
 1. `git pull --rebase origin <текущая ветка>` — состояние лежит в репозитории,
    и параллельный запуск мог его подвинуть.
 2. Прочитай `config/watch.yaml`, `state/cursor.json`, `state/pending.json`.
-3. Прочитай `references/classification.md` и `references/replies.md`. Это не
+3. Прочитай `references/context.md`, `references/classification.md` и
+   `references/replies.md`. Это не
    справочники «на всякий случай» — это правила, по которым принимаются решения
    в шагах 2–3, и они важнее твоей интуиции.
 

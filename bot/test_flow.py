@@ -578,6 +578,95 @@ def test_test_channel():
         clear_pending()
 
 
+def test_held_when_colleague_replied():
+    """Коллега уже откликнулся — бот не лезет в тред, а докладывает владельцу.
+
+    Третий голос в треде, где работа началась, не помогает никому: автор
+    получил реакцию, разработчик занят. А владельцу знать полезно — и
+    решать, нужен ли он там, будет он сам.
+    """
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        # Баг-репорт, на который уже ответил разработчик.
+        fake.thread_replies[(CHANNEL, "1700.000100")] = [
+            {"user": "U0DIMA", "text": "Проверю"},
+        ]
+        app.process_channel_message(
+            {**incoming("1700.000100"), "thread_ts": "1700.000100"}
+        )
+
+        assert not fake.to_channel(), "бот влез в тред, где уже отвечают"
+        notice = fake.to_inbox()
+        assert len(notice) == 1, fake.posted
+        assert "Не влез в тред" in notice[0][2]
+        assert "В треде уже ответили" in notice[0][2], "не показано, кто откликнулся"
+        assert "всё же ответить" in notice[0][2], "нет способа передумать"
+        ok("при чужом ответе бот пишет только в личку и показывает, кто взялся")
+
+        # Модель должна была писать текст для владельца, а не для канала.
+        assert CALLS[-1]["audience"] == "owner", CALLS[-1]
+        ok("модель предупреждена, что ответ увидит только владелец")
+    finally:
+        fake.thread_replies.clear()
+        restore_mode(saved)
+
+
+def test_held_answer_anyway():
+    """✅ на такой сводке всё же отправляет ответ в тред — с новым текстом."""
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        fake.thread_replies[(CHANNEL, "1800.000100")] = [
+            {"user": "U0DIMA", "text": "Проверю"},
+        ]
+        app.process_channel_message(
+            {**incoming("1800.000100"), "thread_ts": "1800.000100"}
+        )
+        with store._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM drafts WHERE status = 'held' ORDER BY created_at DESC"
+            ).fetchone()
+        assert row is not None, "черновик не сохранён как придержанный"
+        fake.reset()
+
+        app.on_reaction({
+            "user": OWNER, "reaction": "white_check_mark",
+            "item": {"channel": row["card_channel"], "ts": row["card_ts"]},
+        })
+        published = fake.to_channel()
+        assert len(published) == 1, fake.posted
+        assert published[0][1] == "1800.000100", "ответ ушёл не в тот тред"
+        assert CALLS[-1]["audience"] == "channel", "текст для канала не перегенерирован"
+        assert store.by_id(row["id"])["status"] == "posted"
+        ok("✅ на придержанной сводке отправляет ответ в тред заново собранным текстом")
+    finally:
+        fake.thread_replies.clear()
+        restore_mode(saved)
+
+
+def test_direct_tag_still_answers_in_thread():
+    """Прямой тег владельца — исключение: там реакция в треде уместна."""
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        fake.thread_replies[(CHANNEL, "1900.000100")] = [
+            {"user": "U0DIMA", "text": "щас гляну"},
+        ]
+        app.process_channel_message({
+            "channel": CHANNEL, "ts": "1900.000100", "thread_ts": "1900.000100",
+            "user": DEV, "text": f"<@{OWNER}> глянь плиз, тут платежи отваливаются",
+        })
+        assert fake.to_channel(), "на прямой тег бот промолчал в треде"
+        ok("на прямой тег владельца бот отвечает в треде даже при чужих ответах")
+    finally:
+        fake.thread_replies.clear()
+        restore_mode(saved)
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),
@@ -597,6 +686,9 @@ TESTS = [
     ("тикет по автоответу", test_autopost_ticket),
     ("низкая уверенность спрашивает", test_autopost_low_confidence_asks),
     ("тестовый канал", test_test_channel),
+    ("в треде уже ответили", test_held_when_colleague_replied),
+    ("всё же ответить в тред", test_held_answer_anyway),
+    ("прямой тег — исключение", test_direct_tag_still_answers_in_thread),
 ]
 
 

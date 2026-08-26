@@ -240,6 +240,63 @@ def autopost(draft_id: str, verdict: dict, *, src_channel: str, src_ts: str,
     log.info("ответил сам в #%s (%s)", channel_name(src_channel), draft_id)
 
 
+def hold(draft_id: str, verdict: dict, *, src_channel: str, src_ts: str,
+         author: str, excerpt: str, thread_excerpt: str) -> None:
+    """Не писать в тред, а рассказать владельцу, что там происходит."""
+    store.resolve(draft_id, "held")
+    notice = app.client.chat_postMessage(
+        channel=OWNER,
+        text=filters.notice_text(
+            draft_id,
+            verdict,
+            channel=channel_name(src_channel),
+            author=author,
+            excerpt=excerpt,
+            link=permalink(src_channel, src_ts),
+            jira_project=jira.PROJECT_KEY,
+            jira_issue_type=jira.ISSUE_TYPE_BUG,
+            mode="held",
+            thread_excerpt=thread_excerpt,
+        ),
+    )
+    store.attach_card(draft_id, notice["channel"], notice["ts"])
+    log.info("не влез в тред в #%s (%s) — доложил в личку", channel_name(src_channel), draft_id)
+
+
+def answer_anyway(draft, instruction: str = "") -> str:
+    """Всё-таки ответить в тред по просьбе владельца.
+
+    Текст генерируется заново: тот, что лежит в черновике, написан для
+    владельца — служебная справка о чужом треде. Отправить её в канал
+    означало бы заговорить с коллегами языком отчёта.
+    """
+    thread_ts = draft["src_thread_ts"] or draft["src_ts"]
+    hint = f"Владелец просит ответить в тред так: {instruction}" if instruction else ""
+    try:
+        verdict = classifier.classify(
+            text=draft["src_excerpt"] or "",
+            author=draft["src_author"] or "?",
+            channel_name=channel_name(draft["src_channel"]),
+            owner_mentioned=False,
+            thread_replies=0,
+            thread_excerpt=hint,
+            audience="channel",
+        )
+    except Exception:
+        log.exception("ответ по просьбе %s", draft["id"])
+        return "Не смог собрать ответ — попробуй ещё раз."
+
+    posted = app.client.chat_postMessage(
+        channel=draft["src_channel"],
+        thread_ts=thread_ts,
+        text=f"{PREFIX} {verdict['reply']}",
+    )
+    store.mark_posted(draft["id"], draft["src_channel"], posted["ts"])
+    store.update_reply(draft["id"], verdict["reply"])
+    store.resolve(draft["id"], "posted")
+    return f"Ответил в треде: «{verdict['reply'][:200]}»"
+
+
 def undo(draft) -> str:
     """Убрать из треда то, что бот сказал от имени владельца."""
     if not draft["posted_ts"]:
@@ -400,6 +457,15 @@ def process_channel_message(event: dict) -> None:
     thread_ts = event.get("thread_ts")
     replies, owner_replied, thread_excerpt = thread_state(channel, thread_ts)
 
+    # Кто-то из команды уже отреагировал — значит работа началась без нас.
+    # Третий голос в треде тут не помогает никому, а владельцу знать полезно:
+    # ответ пойдёт ему в личку и будет написан для него, а не для канала.
+    # Прямой тег владельца — исключение: там короткое «увидел, передаю» в
+    # треде уместно даже при чужих ответах, человек ждёт реакции на своё
+    # обращение. Признак известен до классификации, поэтому маршрут можно
+    # выбрать заранее — а от него зависит, для кого модель пишет текст.
+    held = bool(replies) and not owner_replied and not owner_mentioned
+
     try:
         verdict = classifier.classify(
             text=text,
@@ -409,6 +475,7 @@ def process_channel_message(event: dict) -> None:
             thread_replies=replies,
             thread_excerpt=thread_excerpt,
             owner_replied_in_thread=owner_replied,
+            audience="owner" if held else "channel",
         )
     except classifier.RateLimited as limit:
         # Не ошибка, а решение: квота дороже одной карточки. Сообщение
@@ -461,6 +528,18 @@ def process_channel_message(event: dict) -> None:
         reply_text=verdict["reply"],
         jira_summary=verdict.get("jira_summary", ""),
     )
+
+    if held:
+        hold(
+            draft_id,
+            verdict,
+            src_channel=channel,
+            src_ts=event["ts"],
+            author=author,
+            excerpt=text,
+            thread_excerpt=thread_excerpt,
+        )
+        return
 
     if should_autopost(cls, verdict["confidence"]):
         autopost(
@@ -573,6 +652,26 @@ def handle_inbox(event: dict) -> None:
     if draft is None:
         return  # ничего не ждёт решения — это просто заметка себе
 
+    # Бот придержал ответ: словом можно попросить всё же ответить, завести
+    # тикет или закрыть тему.
+    if draft["status"] == "held":
+        action = decision["action"]
+        instruction = decision["text"] if matched_by_id else decision["original"]
+        if action == "approve":
+            respond(answer_anyway(draft))
+        elif action == "ticket":
+            respond(make_ticket(draft))
+        elif action == "reject":
+            store.resolve(draft["id"], "dropped")
+            respond("Закрыл, в канал ничего не уходило.")
+        elif action == "unclear":
+            respond(
+                f"{describe(draft)}\nОтветить в треде, завести тикет или закрыть?"
+            )
+        else:
+            respond(answer_anyway(draft, instruction))
+        return
+
     # Ответ уже в канале — значит словом можно отменить его, довести до
     # тикета или переписать прямо в треде.
     if draft["status"] == "posted" and draft["posted_ts"]:
@@ -676,6 +775,18 @@ def on_reaction(event):
             reply_in_card(card_channel, card_ts, undo(draft))
         elif reaction in ("ticket", "tickets"):
             reply_in_card(card_channel, card_ts, make_ticket(draft))
+        return
+
+    # Сводка о треде, куда бот не полез: значки означают «всё же ответить»
+    # или «закрыть тему».
+    if draft["status"] == "held":
+        if reaction in ("white_check_mark", "heavy_check_mark", "+1"):
+            reply_in_card(card_channel, card_ts, answer_anyway(draft))
+        elif reaction in ("ticket", "tickets"):
+            reply_in_card(card_channel, card_ts, make_ticket(draft))
+        elif reaction in ("x", "no_entry_sign", "-1"):
+            store.resolve(draft["id"], "dropped")
+            reply_in_card(card_channel, card_ts, "Закрыл, в канал ничего не уходило.")
         return
 
     if draft["status"] != "awaiting":
