@@ -550,6 +550,34 @@ def test_autopost_low_confidence_asks():
         restore_mode(saved)
 
 
+def test_test_channel():
+    """В песочнице разбираются и собственные сообщения владельца.
+
+    Без этого бота нельзя проверить в одиночку: в рабочих каналах он
+    сознательно пропускает всё, что пишет владелец, и молчание выглядит
+    как поломка, хотя это ровно задуманное поведение.
+    """
+    sandbox = "C0BSMS2HK1R"
+    saved_test, saved_watch = app.TEST_CHANNELS, app.WATCH
+    app.TEST_CHANNELS = {sandbox}
+    app.WATCH = set(app.WATCH) | {sandbox}
+    try:
+        clear_pending()
+        fake.reset()
+        own = {"channel": CHANNEL, "ts": "1600.000100", "user": OWNER,
+               "text": "Профиль: не листается список эмблем и рамок"}
+        app.process_channel_message(own)
+        assert not fake.posted, "в рабочем канале сообщение владельца разбирать не должны"
+        ok("в рабочем канале собственные сообщения владельца по-прежнему игнорируются")
+
+        app.process_channel_message({**own, "channel": sandbox, "ts": "1601.000100"})
+        assert fake.posted, "в тестовом канале сообщение владельца осталось без разбора"
+        ok("в тестовом канале бот разбирает сообщение владельца и отвечает")
+    finally:
+        app.TEST_CHANNELS, app.WATCH = saved_test, saved_watch
+        clear_pending()
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),
@@ -568,6 +596,7 @@ TESTS = [
     ("правка отправленного", test_autopost_rewrite),
     ("тикет по автоответу", test_autopost_ticket),
     ("низкая уверенность спрашивает", test_autopost_low_confidence_asks),
+    ("тестовый канал", test_test_channel),
 ]
 
 

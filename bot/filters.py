@@ -36,16 +36,25 @@ def meaningful_length(text: str) -> int:
     return len(MARKUP_RE.sub("", text).strip())
 
 
-def worth_classifying(event: dict, *, owner_id: str, bot_id: str) -> bool:
+def worth_classifying(event: dict, *, owner_id: str, bot_id: str,
+                      include_owner: bool = False) -> bool:
     """Стоит ли тратить на это сообщение вызов модели.
 
     Событие message.channels приходит на каждое сообщение канала, включая
     хадлы и мемы. Отсев регулярками здесь — не оптимизация, а условие
     того, чтобы бот не стоил как небольшой сотрудник.
+
+    `include_owner` включается только для тестовых каналов. В рабочих
+    сообщения владельца не разбираются никогда: бот следит за тем, что
+    пишут ему, а не за тем, что пишет он. Но из-за этого бота нельзя
+    проверить в одиночку — своё же сообщение он молча пропустит, и это
+    выглядит как поломка.
     """
     if event.get("bot_id") or event.get("subtype"):
         return False
-    if event.get("user") in (owner_id, bot_id):
+    if event.get("user") == bot_id:
+        return False
+    if event.get("user") == owner_id and not include_owner:
         return False
 
     text = (event.get("text") or "").strip()

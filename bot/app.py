@@ -68,6 +68,11 @@ def required_env(name: str) -> str:
 OWNER = required_env("OWNER_SLACK_ID")
 WATCH = {c.strip() for c in os.environ.get("WATCH_CHANNELS", "").split(",") if c.strip()}
 DIGEST = {c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()}
+# Каналы для проверки бота в одиночку: здесь разбираются и сообщения самого
+# владельца. В рабочих каналах это было бы вредно — бот отвечал бы на слова
+# того, кому он помогает, — а в песочнице иначе просто нечем проверить.
+TEST_CHANNELS = {c.strip() for c in os.environ.get("TEST_CHANNELS", "").split(",") if c.strip()}
+WATCH |= TEST_CHANNELS
 MARKER = os.environ.get("MARKER_EMOJI", "robot_face")
 AUTO_REPLY_ON_MENTION = os.environ.get("AUTO_REPLY_ON_MENTION", "false").lower() == "true"
 # Классы, на которые бот отвечает сам, не спрашивая. Пусто — прежний режим,
@@ -379,7 +384,12 @@ def process_channel_message(event: dict) -> None:
     if channel not in WATCH:
         # DIGEST-каналы в тред не обслуживаются — они попадают в сводку.
         return
-    if not filters.worth_classifying(event, owner_id=OWNER, bot_id=bot_user_id()):
+    if not filters.worth_classifying(
+        event,
+        owner_id=OWNER,
+        bot_id=bot_user_id(),
+        include_owner=channel in TEST_CHANNELS,
+    ):
         return
     if store.already_seen(channel, event["ts"]):
         return
@@ -794,7 +804,7 @@ if __name__ == "__main__":
     store.init()
     log.info(
         "Глебот стартует · разбор через %s · модель %s · каналы %s · "
-        "сам отвечает на: %s · сводка в %s · добор %s ч",
+        "сам отвечает на: %s · сводка в %s · добор %s ч · тестовые каналы: %s",
         "Anthropic API" if classifier.backend() == "api"
         else f"подписку Claude Code ({classifier.cli_path()})",
         classifier.MODEL,
@@ -802,6 +812,7 @@ if __name__ == "__main__":
         ", ".join(sorted(AUTOPOST_CLASSES)) or "ничего, всё через одобрение",
         DIGEST_AT,
         BACKFILL_HOURS,
+        ", ".join(sorted(TEST_CHANNELS)) or "нет",
     )
 
     backfill()
