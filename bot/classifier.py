@@ -171,11 +171,39 @@ def _cli_candidates() -> list[str]:
             os.path.join(root, "Programs", "Claude", "claude-code", "*", "claude.exe"),
             os.path.join(root, "npm", "claude.cmd"),
         ]
+    # Claude Code ставится упакованным (MSIX), и тогда его `AppData\Roaming`
+    # физически лежит внутри каталога пакета. Процессы самого приложения
+    # видят его как обычный %APPDATA%\Claude, а любой посторонний процесс —
+    # включая нашего бота, запущенного из своего терминала, — не видит там
+    # ничего. Поэтому ищем и по настоящему пути тоже.
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    patterns.append(
+        os.path.join(local, "Packages", "*", "LocalCache", "Roaming",
+                     "Claude", "claude-code", "*", "claude.exe")
+    )
     patterns += [
         os.path.join(home, ".claude", "local", "claude"),
         os.path.join(home, ".claude", "local", "claude.exe"),
     ]
     return patterns
+
+
+def _cli_env() -> dict:
+    """Окружение для запуска CLI.
+
+    Если бинарник живёт внутри каталога пакета, то там же лежит и вся его
+    настройка, включая авторизацию. Снаружи контейнера %APPDATA% указывает
+    в другое место, и CLI, не найдя своих файлов, попросит залогиниться
+    заново — то есть в фоновом процессе просто зависнет. Подменяем
+    переменную на тот каталог, из которого бинарник и взят.
+    """
+    env = os.environ.copy()
+    marker = os.sep + "LocalCache" + os.sep + "Roaming" + os.sep
+    path = cli_path()
+    index = path.find(marker)
+    if index != -1:
+        env["APPDATA"] = path[: index + len(marker) - 1]
+    return env
 
 
 @functools.lru_cache(maxsize=1)
@@ -377,6 +405,7 @@ def _classify_cli(context: dict) -> dict:
         text=True,
         encoding="utf-8",
         timeout=CLI_TIMEOUT,
+        env=_cli_env(),
     )
     if proc.returncode != 0:
         raise RuntimeError(
