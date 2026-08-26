@@ -24,12 +24,15 @@ from __future__ import annotations
 import functools
 import glob
 import json
+import logging
 import os
 import pathlib
 import re
 import shutil
 import subprocess
 import time
+
+_log = logging.getLogger("glebot.classifier")
 
 MODEL = os.environ.get("GLEBOT_MODEL", "claude-opus-5")
 BACKEND = os.environ.get("GLEBOT_BACKEND", "").strip().lower()
@@ -180,13 +183,15 @@ def cli_path() -> str:
     """Путь к бинарнику Claude Code — или отказ, объясняющий, где искали."""
     explicit = os.environ.get("CLAUDE_CLI")
     if explicit:
-        if not os.path.exists(explicit):
-            raise RuntimeError(
-                f"CLAUDE_CLI указывает на {explicit}, но там ничего нет. "
-                "Claude Code мог обновиться и сменить номер версии в пути — "
-                "поправь переменную или убери её, чтобы искалось само."
-            )
-        return explicit
+        if os.path.exists(explicit):
+            return explicit
+        # Не приговор: Claude Code обновляется и меняет номер версии в пути,
+        # так что вчерашняя верная настройка сегодня указывает в пустоту.
+        # Ронять из-за этого бота, когда рядом лежит рабочий бинарник,
+        # было бы худшим из возможных решений — просто ищем дальше.
+        _log.warning(
+            "CLAUDE_CLI указывает на %s, но там ничего нет — ищу сам", explicit
+        )
 
     for name in ("claude", "claude.exe", "claude.cmd"):
         found = shutil.which(name)
