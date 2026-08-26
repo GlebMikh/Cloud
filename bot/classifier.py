@@ -143,30 +143,68 @@ def backend() -> str:
     return "api" if os.environ.get("ANTHROPIC_API_KEY") else "cli"
 
 
+def _cli_candidates() -> list[str]:
+    """Куда имеет смысл заглянуть в поисках бинарника Claude Code.
+
+    В PATH он попадает не всегда: у десктопной установки он лежит внутри
+    каталога приложения, рядом с номером версии, а каталог этот
+    определяется переменной окружения, которой в чужой сессии может и не
+    оказаться. Поэтому список, а не одно место, и `~` разворачивается
+    отдельно — на случай, когда APPDATA пуста.
+    """
+    home = os.path.expanduser("~")
+    roots = [
+        os.environ.get("APPDATA") or "",
+        os.path.join(home, "AppData", "Roaming"),
+        os.environ.get("LOCALAPPDATA") or "",
+        os.path.join(home, "AppData", "Local"),
+    ]
+    patterns = []
+    for root in roots:
+        if not root:
+            continue
+        patterns += [
+            os.path.join(root, "Claude", "claude-code", "*", "claude.exe"),
+            os.path.join(root, "Programs", "Claude", "claude-code", "*", "claude.exe"),
+            os.path.join(root, "npm", "claude.cmd"),
+        ]
+    patterns += [
+        os.path.join(home, ".claude", "local", "claude"),
+        os.path.join(home, ".claude", "local", "claude.exe"),
+    ]
+    return patterns
+
+
 @functools.lru_cache(maxsize=1)
 def cli_path() -> str:
-    """Где лежит бинарник Claude Code.
-
-    В PATH он попадает не всегда: у десктопной установки он живёт внутри
-    каталога приложения, рядом с номером версии. Берём самую свежую.
-    """
+    """Путь к бинарнику Claude Code — или отказ, объясняющий, где искали."""
     explicit = os.environ.get("CLAUDE_CLI")
     if explicit:
+        if not os.path.exists(explicit):
+            raise RuntimeError(
+                f"CLAUDE_CLI указывает на {explicit}, но там ничего нет. "
+                "Claude Code мог обновиться и сменить номер версии в пути — "
+                "поправь переменную или убери её, чтобы искалось само."
+            )
         return explicit
 
-    found = shutil.which("claude")
-    if found:
-        return found
+    for name in ("claude", "claude.exe", "claude.cmd"):
+        found = shutil.which(name)
+        if found:
+            return found
 
-    appdata = os.environ.get("APPDATA") or ""
-    candidates = sorted(glob.glob(os.path.join(appdata, "Claude", "claude-code", "*", "claude.exe")))
-    if candidates:
-        return candidates[-1]
+    probed = _cli_candidates()
+    hits = sorted({path for pattern in probed for path in glob.glob(pattern)})
+    if hits:
+        # Версий может лежать несколько — берём старшую по имени каталога.
+        return hits[-1]
 
     raise RuntimeError(
         "Не найден Claude Code CLI. Он нужен, когда классификация идёт по "
-        "подписке, а не по API-ключу. Укажи путь в переменной CLAUDE_CLI "
-        "или задай ANTHROPIC_API_KEY, чтобы работать через API."
+        "подписке, а не по API-ключу.\nИскал в PATH и здесь:\n  "
+        + "\n  ".join(probed)
+        + "\nУкажи путь в переменной CLAUDE_CLI (строка в .env) или задай "
+        "ANTHROPIC_API_KEY, чтобы работать через API."
     )
 
 

@@ -1,0 +1,5 @@
+2026-08-26 11:14:07,321 INFO glebot: Глебот стартует · разбор через подписку Claude Code (C:\Users\gleb1\AppData\Roaming\Claude\claude-code\2.1.241\claude.exe) · модель claude-opus-5 · каналы C099240QR3N, C099GHLHAJV · авто-ответ на теги: False · сводка в 09:30 · добор 24 ч
+2026-08-26 11:14:09,615 INFO glebot: добор истории за 24 ч завершён
+2026-08-26 11:14:11,148 INFO slack_bolt.App: A new session has been established (session id: fb44d70b-9f30-4b09-b00e-7efdaedf9d69)
+2026-08-26 11:14:11,148 INFO slack_bolt.App: Bolt app is running!
+2026-08-26 11:14:11,245 INFO slack_bolt.App: Starting to receive messages from a new connection (session id: fb44d70b-9f30-4b09-b00e-7efdaedf9d69)
