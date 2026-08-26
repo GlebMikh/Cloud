@@ -114,7 +114,7 @@ bot\requirements.txt`, `python bot\app.py`. Экспортировать пер�
 ```powershell
 $s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Glebot.lnk")
 $s.TargetPath = "wscript.exe"
-$s.Arguments = '"D:\Claude_agents\Cloudot\glebot-hidden.vbs"'
+$s.Arguments = '"D:\Claude_agents\Cloud\bot\glebot-hidden.vbs"'
 $s.Save()
 ```
 
