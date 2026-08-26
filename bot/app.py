@@ -267,6 +267,12 @@ def process_channel_message(event: dict) -> None:
             thread_excerpt=thread_excerpt,
             owner_replied_in_thread=owner_replied,
         )
+    except classifier.RateLimited as limit:
+        # Не ошибка, а решение: квота дороже одной карточки. Сообщение
+        # остаётся неразобранным и без метки — добор при следующем старте
+        # к нему вернётся.
+        log.warning("пропускаю разбор: %s", limit)
+        return
     except Exception:
         # Молчание при недоступной модели безопаснее ответа наугад.
         log.exception("classify")
@@ -620,8 +626,10 @@ def scheduler() -> None:
 if __name__ == "__main__":
     store.init()
     log.info(
-        "Глебот стартует · модель %s · каналы %s · авто-ответ на теги: %s · "
-        "сводка в %s · добор %s ч",
+        "Глебот стартует · разбор через %s · модель %s · каналы %s · "
+        "авто-ответ на теги: %s · сводка в %s · добор %s ч",
+        "Anthropic API" if classifier.backend() == "api"
+        else f"подписку Claude Code ({classifier.cli_path()})",
         classifier.MODEL,
         ", ".join(sorted(WATCH)) or "не заданы",
         AUTO_REPLY_ON_MENTION,

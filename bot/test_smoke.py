@@ -7,6 +7,7 @@
 служит записью состояния для часового агента.
 """
 
+import json
 import os
 import pathlib
 import sys
@@ -174,6 +175,82 @@ def test_expiry():
     ok("протухшая отменена, свежая не тронута")
 
 
+def test_verdict_parsing():
+    """Разбор ответа модели, когда схему гарантировать нечем.
+
+    На бэкенде `cli` формат — это просьба в промпте, а не контракт API:
+    модель может обернуть JSON в ```json, приписать «Вот результат» или
+    вернуть класс строчными. Каждый такой случай, не разобранный здесь,
+    означает молча потерянное сообщение канала.
+    """
+    canonical = classifier.parse_verdict(
+        '{"cls":"BUG","confidence":"высокая","reason":"симптом",'
+        '"reply":"Похоже на баг.","jira_summary":"Профиль: не листается"}'
+    )
+    assert canonical["cls"] == "BUG"
+    assert canonical["reply"] == "Похоже на баг."
+
+    fenced = classifier.parse_verdict(
+        'Вот результат:\n```json\n{"cls":"noise","confidence":"ВЫСОКАЯ",'
+        '"reason":"трёп","reply":"","jira_summary":""}\n```\nГотово.'
+    )
+    assert fenced["cls"] == "NOISE", "класс строчными не опознан"
+    assert fenced["confidence"] == "высокая"
+    ok("обёртки, болтовня вокруг JSON и регистр класса разбираются")
+
+    loose = classifier.parse_verdict(
+        'Разобрал так: {"cls":"QUESTION","confidence":"не знаю","reason":"?",'
+        '"reply":"Уточню у Глеба.","jira_summary":""} — как-то так.'
+    )
+    assert loose["confidence"] == "средняя", "неизвестная уверенность должна падать в среднюю"
+    ok("неизвестная уверенность не теряет весь разбор")
+
+    for broken in ("совсем не json", '{"cls":"ЧТО-ТО","confidence":"высокая"}'):
+        try:
+            classifier.parse_verdict(broken)
+            raise AssertionError(f"мусор {broken!r} прошёл как вердикт")
+        except (ValueError, json.JSONDecodeError):
+            pass
+    ok("мусор и неизвестный класс отвергаются, а не превращаются в карточку")
+
+
+def test_backend_choice():
+    """Чем платим — выбирается само, но приказ важнее догадки."""
+    saved = (classifier.BACKEND, os.environ.get("ANTHROPIC_API_KEY"))
+    try:
+        classifier.BACKEND = ""
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-something"
+        assert classifier.backend() == "api"
+        del os.environ["ANTHROPIC_API_KEY"]
+        assert classifier.backend() == "cli", "без ключа разбор должен идти по подписке"
+        classifier.BACKEND = "api"
+        assert classifier.backend() == "api", "явно заданный бэкенд должен побеждать"
+    finally:
+        classifier.BACKEND = saved[0]
+        if saved[1] is not None:
+            os.environ["ANTHROPIC_API_KEY"] = saved[1]
+    ok("бэкенд выбирается по наличию ключа и переопределяется вручную")
+
+
+def test_rate_cap():
+    """Потолок в час защищает квоту, а не данные — но защищает жёстко."""
+    saved, calls = classifier.MAX_PER_HOUR, list(classifier._calls)
+    try:
+        classifier.MAX_PER_HOUR = 2
+        classifier._calls.clear()
+        classifier._check_rate()
+        classifier._check_rate()
+        try:
+            classifier._check_rate()
+            raise AssertionError("третий разбор прошёл мимо потолка")
+        except classifier.RateLimited:
+            pass
+    finally:
+        classifier.MAX_PER_HOUR = saved
+        classifier._calls[:] = calls
+    ok("потолок разборов в час срабатывает")
+
+
 def test_card():
     card = filters.card_text(
         "a1b2",
@@ -205,6 +282,9 @@ if __name__ == "__main__":
         ("хранилище черновиков", test_store),
         ("jira без настройки", test_jira_optional),
         ("рубрика классификатора", test_rubric),
+        ("разбор вердикта модели", test_verdict_parsing),
+        ("выбор бэкенда", test_backend_choice),
+        ("потолок разборов в час", test_rate_cap),
         ("разбор решений владельца", test_decisions),
         ("поиск карточки", test_draft_lookup),
         ("отмена просроченных", test_expiry),
