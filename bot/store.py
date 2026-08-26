@@ -38,6 +38,17 @@ CREATE TABLE IF NOT EXISTS drafts (
 -- и по исходному сообщению (не разбирали ли мы его уже?).
 CREATE INDEX IF NOT EXISTS drafts_card ON drafts (card_channel, card_ts);
 CREATE UNIQUE INDEX IF NOT EXISTS drafts_src ON drafts (src_channel, src_ts);
+
+-- Каждое сообщение, дошедшее до модели, независимо от вердикта.
+-- Черновик остаётся только от разговорного меньшинства, а платим мы за все:
+-- без этой таблицы добор истории при каждом старте гонит через Claude одни
+-- и те же сутки болтовни заново.
+CREATE TABLE IF NOT EXISTS seen (
+    channel TEXT NOT NULL,
+    ts      TEXT NOT NULL,
+    at      REAL NOT NULL,
+    PRIMARY KEY (channel, ts)
+);
 """
 
 
@@ -58,13 +69,40 @@ def already_seen(channel: str, ts: str) -> bool:
     Вторая линия защиты после реакции-метки: Slack умеет доставлять
     событие повторно, и без этой проверки владелец получит две одинаковые
     карточки на одно сообщение.
+
+    Смотрим в обе таблицы. Метка-реакция остаётся только на сообщениях,
+    из которых вышел черновик, а деньги модель берёт за каждое: болтовня,
+    разобранная и признанная болтовнёй, обязана остаться разобранной и
+    после перезапуска.
     """
     with _connect() as conn:
         row = conn.execute(
-            "SELECT 1 FROM drafts WHERE src_channel = ? AND src_ts = ?",
-            (channel, ts),
+            "SELECT 1 FROM drafts WHERE src_channel = ? AND src_ts = ? "
+            "UNION ALL SELECT 1 FROM seen WHERE channel = ? AND ts = ? LIMIT 1",
+            (channel, ts, channel, ts),
         ).fetchone()
     return row is not None
+
+
+def mark_seen(channel: str, ts: str) -> None:
+    """Запомнить, что сообщение уже проходило через классификатор."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO seen (channel, ts, at) VALUES (?, ?, ?)",
+            (channel, ts, time.time()),
+        )
+
+
+def purge_seen_older_than(days: float) -> int:
+    """Подчистить журнал разобранного.
+
+    Держать его вечно незачем: добор истории смотрит на последние
+    BACKFILL_HOURS часов, всё, что старше, второй раз не всплывёт.
+    """
+    cutoff = time.time() - days * 86400
+    with _connect() as conn:
+        cursor = conn.execute("DELETE FROM seen WHERE at < ?", (cutoff,))
+        return cursor.rowcount
 
 
 def create(**fields) -> str:

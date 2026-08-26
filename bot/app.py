@@ -25,6 +25,18 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# .env читается ДО импорта своих модулей: они разбирают окружение прямо при
+# импорте (ключ Anthropic, путь к базе, настройки Jira). Загрузка после
+# импортов выглядела бы рабочей и молча брала бы значения по умолчанию.
+# Библиотека необязательная: на хостинге переменные приходят из окружения,
+# а .env нужен только на своей машине.
+try:  # noqa: SIM105
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 import classifier  # noqa: E402
 import daily  # noqa: E402
 import filters  # noqa: E402
@@ -36,7 +48,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("glebot")
 
-OWNER = os.environ["OWNER_SLACK_ID"]
+
+def required_env(name: str) -> str:
+    """Обязательная переменная окружения — или внятный отказ стартовать.
+
+    Первое, обо что спотыкается любой запуск, — незаполненный .env, и
+    голый KeyError в трейсбеке не подсказывает, что делать дальше.
+    """
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(
+            f"Не задана переменная {name}.\n"
+            "Скопируй bot/.env.example в .env в корне репозитория и впиши "
+            "значения — где их взять, написано в bot/README.md."
+        )
+    return value
+
+
+OWNER = required_env("OWNER_SLACK_ID")
 WATCH = {c.strip() for c in os.environ.get("WATCH_CHANNELS", "").split(",") if c.strip()}
 DIGEST = {c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()}
 MARKER = os.environ.get("MARKER_EMOJI", "robot_face")
@@ -53,10 +82,20 @@ PREFIX = ":robot_face: *Глебот* (AI-помощник Глеба):"
 # Не влезать в тред, где разговор уже идёт своим ходом.
 SKIP_THREAD_IF_REPLIES_GTE = 3
 
-app = App(
-    token=os.environ["SLACK_BOT_TOKEN"],
-    signing_secret=os.environ["SLACK_SIGNING_SECRET"],
-)
+try:
+    app = App(
+        token=required_env("SLACK_BOT_TOKEN"),
+        signing_secret=required_env("SLACK_SIGNING_SECRET"),
+    )
+except Exception as exc:  # токены есть, но Slack их не принял
+    # Bolt проверяет токен при создании приложения и падает трейсбеком на
+    # тридцать строк. Второй по частоте промах после пустого .env —
+    # перепутанные местами токены, и об этом стоит сказать словами.
+    sys.exit(
+        f"Slack не принял токены: {exc}\n"
+        "Проверь SLACK_BOT_TOKEN (начинается с xoxb-) и SLACK_SIGNING_SECRET "
+        "в .env — оба берутся на api.slack.com/apps, порядок в bot/README.md."
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -233,8 +272,19 @@ def process_channel_message(event: dict) -> None:
         log.exception("classify")
         return
 
+    # Разобрано — независимо от вердикта. Метка-реакция ляжет только на то,
+    # из чего вышел черновик, а заплачено уже за всё: без этой записи добор
+    # истории при следующем старте прогонит через модель те же сутки заново.
+    store.mark_seen(channel, event["ts"])
+
     cls = verdict["cls"]
-    log.info("%s / %s — %s", cls, verdict["confidence"], verdict["reason"])
+    log.info(
+        "%s / %s — %s (кеш %s токенов)",
+        cls,
+        verdict["confidence"],
+        verdict["reason"],
+        verdict.get("_usage", {}).get("cached", "?"),
+    )
 
     if cls not in classifier.ACTIONABLE or not verdict["reply"].strip():
         return
@@ -331,6 +381,11 @@ def handle_inbox(event: dict) -> None:
     """Ответ владельца в личке: решение по карточке или правка."""
     if event.get("user") != OWNER:
         return
+    # Правка сообщения, удаление, ответ бота — не решения. Slack шлёт их
+    # тем же событием, и без этой проверки исправленная опечатка в «ок»
+    # выглядит как второе одобрение.
+    if event.get("subtype") or event.get("bot_id"):
+        return
 
     text = (event.get("text") or "").strip()
     if not text:
@@ -401,6 +456,7 @@ def handle_inbox(event: dict) -> None:
         return
 
     store.update_reply(draft["id"], verdict["reply"])
+    old_card_channel, old_card_ts = draft["card_channel"], draft["card_ts"]
     send_card(
         draft["id"],
         {**verdict, "cls": draft["cls"], "confidence": draft["confidence"]},
@@ -410,6 +466,19 @@ def handle_inbox(event: dict) -> None:
         excerpt=draft["src_excerpt"] or "",
         revision=2,
     )
+    # Решение теперь ищется по новой карточке, и галочка на старой не сделает
+    # ничего — молча. Сказать об этом дешевле, чем разбираться, почему ответ
+    # не ушёл.
+    if old_card_channel and old_card_ts:
+        try:
+            reply_in_card(
+                old_card_channel,
+                old_card_ts,
+                "Переписал — решение принимаю по новой карточке ниже. "
+                "Реакции на этой больше не действуют.",
+            )
+        except Exception:
+            log.exception("пометка старой карточки %s", draft["id"])
 
 
 def reply_in_card(channel: str, thread_ts: str, text: str) -> None:
@@ -459,6 +528,19 @@ def has_marker(message: dict) -> bool:
     )
 
 
+def safe_process(event: dict) -> None:
+    """Разобрать сообщение из истории, не роняя весь добор.
+
+    Одно сообщение, на котором споткнулись, не должно уносить остальные
+    сутки: бот в этот момент ещё даже не начал слушать события, и упавший
+    добор означает молчание до следующего рестарта.
+    """
+    try:
+        process_channel_message(event)
+    except Exception:
+        log.exception("разбор %s / %s", event.get("channel"), event.get("ts"))
+
+
 def backfill() -> None:
     """Разобрать историю, накопившуюся, пока процесс не работал.
 
@@ -487,7 +569,7 @@ def backfill() -> None:
         # Slack отдаёт новые первыми, а разбирать надо в порядке разговора.
         for message in reversed(history):
             if float(message.get("ts", 0)) >= oldest and not has_marker(message):
-                process_channel_message({**message, "channel": channel})
+                safe_process({**message, "channel": channel})
             if float(message.get("latest_reply", 0)) >= oldest:
                 backfill_thread(channel, message["ts"], oldest)
 
@@ -509,9 +591,7 @@ def backfill_thread(channel: str, thread_ts: str, oldest: float) -> None:
             continue  # корень уже разобран выше или слишком стар
         if float(reply.get("ts", 0)) < oldest or has_marker(reply):
             continue
-        process_channel_message(
-            {**reply, "channel": channel, "thread_ts": thread_ts}
-        )
+        safe_process({**reply, "channel": channel, "thread_ts": thread_ts})
 
 
 def scheduler() -> None:
@@ -552,4 +632,4 @@ if __name__ == "__main__":
     backfill()
     threading.Thread(target=scheduler, daemon=True, name="glebot-scheduler").start()
 
-    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+    SocketModeHandler(app, required_env("SLACK_APP_TOKEN")).start()

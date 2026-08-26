@@ -116,6 +116,12 @@ def build_summary(digest_lines: list[str], expired_count: int) -> str | None:
 def run(client, *, inbox: str, digest_channels: dict[str, str], owner_id: str,
         bot_id: str, expiry_hours: float = 24, window_hours: int = 24) -> None:
     """Один прогон будильника."""
+    # Журнал разобранного нужен ровно на глубину добора истории; недельного
+    # запаса хватает с большим краем, а база остаётся маленькой.
+    purged = store.purge_seen_older_than(7)
+    if purged:
+        log.info("журнал разобранного: вычищено %s записей", purged)
+
     expired = expire_stale(client, inbox=inbox, hours=expiry_hours)
     lines = collect_digest_channels(
         client, digest_channels, hours=window_hours,

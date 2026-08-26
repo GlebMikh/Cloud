@@ -1,0 +1,17 @@
+# Запуск на своей машине или на VPS:  docker compose up -d
+# Логи:                                docker compose logs -f
+#
+# Токены берутся из .env рядом с этим файлом (образец — bot/.env.example).
+# В образ они не попадают: .env читается при запуске контейнера.
+services:
+  glebot:
+    build: .
+    env_file: .env
+    # Без этого контейнер молча уйдёт после падения сети или рестарта хоста,
+    # и о том, что бот не работает, станет ясно по отсутствию карточек.
+    restart: unless-stopped
+    volumes:
+      - glebot-state:/data
+
+volumes:
+  glebot-state:
