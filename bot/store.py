@@ -19,7 +19,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS drafts (
     id            TEXT PRIMARY KEY,
     created_at    REAL NOT NULL,
-    status        TEXT NOT NULL,          -- awaiting | posted | dropped | expired
+    status        TEXT NOT NULL,          -- awaiting | delayed | held | posted
+                                          -- | dropped | undone | expired
     cls           TEXT NOT NULL,
     confidence    TEXT NOT NULL,
     src_channel   TEXT NOT NULL,
@@ -207,6 +208,25 @@ def by_id_prefix(prefix: str) -> sqlite3.Row | None:
             (prefix + "%",),
         ).fetchall()
     return rows[0] if len(rows) == 1 else None
+
+
+def mark_delayed(draft_id: str) -> None:
+    """Черновик ждёт своей минуты: ответ готов, но ещё не отправлен.
+
+    Отдельный статус, а не флаг: если процесс погасят в эти две минуты,
+    при следующем старте по нему видно, что ответ так и не ушёл, — и
+    можно решить, что с ним делать.
+    """
+    with _connect() as conn:
+        conn.execute("UPDATE drafts SET status = 'delayed' WHERE id = ?", (draft_id,))
+
+
+def delayed() -> list[sqlite3.Row]:
+    """Черновики, застрявшие в ожидании отправки, — старые первыми."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM drafts WHERE status = 'delayed' ORDER BY created_at"
+        ).fetchall()
 
 
 def recently_posted(minutes: float = 120) -> list[sqlite3.Row]:

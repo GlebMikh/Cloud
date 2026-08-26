@@ -36,6 +36,10 @@ os.environ.update(
     AUTO_REPLY_ON_MENTION="false",
     AUTOPOST_CLASSES="",
     AUTOPOST_MIN_CONFIDENCE="средняя",
+    # Пауза перед ответом здесь выключена: проверки, которым она нужна,
+    # включают её сами. Иначе каждая из остальных ждала бы две минуты
+    # или, что хуже, молча проверяла бы не то.
+    REPLY_DELAY_SECONDS="0",
 )
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-placeholder")
 
@@ -667,6 +671,153 @@ def test_direct_tag_still_answers_in_thread():
         restore_mode(saved)
 
 
+def delayed_mode(seconds=300):
+    """Включить паузу перед ответом, но так, чтобы таймер не выстрелил сам."""
+    saved = app.REPLY_DELAY
+    app.REPLY_DELAY = seconds
+    return saved
+
+
+def stop_timers():
+    for timer in list(app._timers.values()):
+        timer.cancel()
+    app._timers.clear()
+
+
+def only_delayed():
+    with store._connect() as conn:
+        return conn.execute(
+            "SELECT * FROM drafts WHERE status = 'delayed' ORDER BY created_at DESC"
+        ).fetchone()
+
+
+def test_delay_holds_reply():
+    """Ответ не уходит сразу — он ждёт своей минуты."""
+    saved_mode, saved_delay = autopost_mode(), delayed_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("2000.000100"))
+
+        assert not fake.posted, "ответ ушёл, не дождавшись паузы"
+        row = only_delayed()
+        assert row is not None and row["reply_text"], "черновик не сохранён как отложенный"
+        assert row["id"] in app._timers, "таймер на отправку не заведён"
+        ok("ответ отложен: в канал ничего, черновик ждёт в базе")
+    finally:
+        stop_timers()
+        restore_mode(saved_mode)
+        app.REPLY_DELAY = saved_delay
+
+
+def test_delay_delivers_when_quiet():
+    """Никто не откликнулся за паузу — ответ уходит как задумано."""
+    saved_mode, saved_delay = autopost_mode(), delayed_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("2100.000100"))
+        row = only_delayed()
+        stop_timers()
+        fake.reset()
+
+        app.deliver(row["id"])
+        assert len(fake.to_channel()) == 1, fake.posted
+        assert fake.to_inbox(), "сводка владельцу не пришла"
+        assert store.by_id(row["id"])["status"] == "posted"
+        ok("после паузы в тишине ответ уходит в тред и приходит сводка")
+    finally:
+        stop_timers()
+        restore_mode(saved_mode)
+        app.REPLY_DELAY = saved_delay
+
+
+def test_delay_yields_to_human():
+    """Пока бот ждал, откликнулся живой — в канал уже не лезем.
+
+    Ровно та ситуация, ради которой пауза и заведена: разработчик пишет
+    «проверю» через минуту после баг-репорта, и реплика бота следом
+    выглядит как разговор с самим собой.
+    """
+    saved_mode, saved_delay = autopost_mode(), delayed_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("2200.000100"))
+        row = only_delayed()
+        stop_timers()
+
+        # За время паузы в треде появился человек.
+        fake.thread_replies[(CHANNEL, "2200.000100")] = [
+            {"user": "U0DIMA", "text": "Проверю"},
+        ]
+        fake.reset()
+        app.deliver(row["id"])
+
+        assert not fake.to_channel(), "бот всё же влез в тред после чужого ответа"
+        notice = fake.to_inbox()
+        assert notice and "Не влез в тред" in notice[0][2], notice
+        assert CALLS[-1]["audience"] == "owner", "текст не переписан для владельца"
+        assert store.by_id(row["id"])["status"] == "held"
+        ok("живой ответ за время паузы отменяет реплику в канал")
+    finally:
+        fake.thread_replies.clear()
+        stop_timers()
+        restore_mode(saved_mode)
+        app.REPLY_DELAY = saved_delay
+
+
+def test_delay_owner_answered():
+    """Владелец ответил сам — бот исчезает молча, без сводки."""
+    saved_mode, saved_delay = autopost_mode(), delayed_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("2300.000100"))
+        row = only_delayed()
+        stop_timers()
+
+        fake.thread_replies[(CHANNEL, "2300.000100")] = [
+            {"user": OWNER, "text": "уже смотрим"},
+        ]
+        fake.reset()
+        app.deliver(row["id"])
+
+        assert not fake.posted, "бот что-то сказал, хотя владелец ответил сам"
+        assert store.by_id(row["id"])["status"] == "dropped"
+        ok("если владелец ответил сам, отложенный ответ тихо снимается")
+    finally:
+        fake.thread_replies.clear()
+        stop_timers()
+        restore_mode(saved_mode)
+        app.REPLY_DELAY = saved_delay
+
+
+def test_delay_survives_restart():
+    """Отложенный ответ не должен пропасть вместе с процессом.
+
+    Таймер жил в памяти; после перезапуска его нет. Без разбора при старте
+    ответ не ушёл бы ни в канал, ни в личку — просто исчез бы.
+    """
+    saved_mode, saved_delay = autopost_mode(), delayed_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("2400.000100"))
+        row = only_delayed()
+        stop_timers()          # как будто процесс погасили
+        fake.reset()
+
+        app.recover_delayed()
+        assert store.by_id(row["id"])["status"] in ("posted", "held"), "ответ завис навсегда"
+        assert fake.posted, "после перезапуска ничего не произошло"
+        ok("отложенный ответ разбирается при следующем старте, а не теряется")
+    finally:
+        stop_timers()
+        restore_mode(saved_mode)
+        app.REPLY_DELAY = saved_delay
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),
@@ -689,6 +840,11 @@ TESTS = [
     ("в треде уже ответили", test_held_when_colleague_replied),
     ("всё же ответить в тред", test_held_answer_anyway),
     ("прямой тег — исключение", test_direct_tag_still_answers_in_thread),
+    ("пауза перед ответом", test_delay_holds_reply),
+    ("после паузы в тишине", test_delay_delivers_when_quiet),
+    ("живой успел раньше", test_delay_yields_to_human),
+    ("владелец ответил сам", test_delay_owner_answered),
+    ("пауза переживает перезапуск", test_delay_survives_restart),
 ]
 
 

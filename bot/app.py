@@ -99,6 +99,18 @@ PREFIX = ":robot_face: *Глебот* (AI-помощник Глеба):"
 # Не влезать в тред, где разговор уже идёт своим ходом.
 SKIP_THREAD_IF_REPLIES_GTE = 3
 
+# Пауза перед автоответом, секунды. Бот выбирает маршрут по состоянию треда
+# на момент разбора — но живой коллега может откликнуться секундой позже, и
+# тогда бот уже высказался. Пауза даёт людям фору: перед отправкой тред
+# перечитывается заново, и если там кто-то появился, ответ не уходит в канал
+# вовсе. 0 — отвечать сразу.
+REPLY_DELAY = int(os.environ.get("REPLY_DELAY_SECONDS", "120"))
+# Отложенный ответ, переживший перезапуск, старше этого возраста в канал не
+# уходит: в разговоре двухчасовой давности реплика бота выглядит нелепо.
+STALE_DELAYED_MINUTES = float(os.environ.get("STALE_DELAYED_MINUTES", "30"))
+# Живые таймеры — чтобы их можно было отменить при остановке и в тестах.
+_timers: dict[str, threading.Timer] = {}
+
 try:
     app = App(
         token=required_env("SLACK_BOT_TOKEN"),
@@ -295,6 +307,109 @@ def answer_anyway(draft, instruction: str = "") -> str:
     store.update_reply(draft["id"], verdict["reply"])
     store.resolve(draft["id"], "posted")
     return f"Ответил в треде: «{verdict['reply'][:200]}»"
+
+
+def verdict_from(draft) -> dict:
+    """Собрать вердикт обратно из записи — тем, кто отправляет с задержкой."""
+    return {
+        "cls": draft["cls"],
+        "confidence": draft["confidence"],
+        "reason": "",
+        "reply": draft["reply_text"] or "",
+        "jira_summary": draft["jira_summary"] or "",
+    }
+
+
+def schedule_reply(draft_id: str) -> None:
+    """Отложить отправку и вернуться к ней через паузу."""
+    store.mark_delayed(draft_id)
+    timer = threading.Timer(REPLY_DELAY, deliver, args=(draft_id,))
+    timer.daemon = True
+    _timers[draft_id] = timer
+    timer.start()
+    log.info("ответ %s отложен на %s с — жду, не откликнется ли живой", draft_id, REPLY_DELAY)
+
+
+def deliver(draft_id: str) -> None:
+    """Отправить отложенный ответ — если он всё ещё нужен.
+
+    Здесь и происходит главное: тред перечитывается заново. За минуту-две
+    мог откликнуться разработчик, мог ответить сам владелец, тема могла
+    закрыться. Отправлять вслепую то, что решено две минуты назад, — ровно
+    та ошибка, ради которой пауза и заводилась.
+    """
+    _timers.pop(draft_id, None)
+    draft = store.by_id(draft_id)
+    if draft is None or draft["status"] != "delayed":
+        return  # владелец уже что-то сделал с этим черновиком
+
+    channel = draft["src_channel"]
+    thread_ts = draft["src_thread_ts"] or draft["src_ts"]
+    replies, owner_replied, thread_excerpt = thread_state(channel, thread_ts)
+    verdict = verdict_from(draft)
+    stale = (time.time() - draft["created_at"]) > STALE_DELAYED_MINUTES * 60
+
+    if owner_replied:
+        # Владелец ответил сам, пока бот выжидал. Лучшее, что можно сделать, —
+        # исчезнуть: он уже в курсе темы, сводка ему ничего не добавит.
+        store.resolve(draft_id, "dropped")
+        log.info("ответ %s не понадобился: владелец ответил сам", draft_id)
+        return
+
+    if replies or stale:
+        # Кто-то откликнулся за время паузы — или пауза затянулась из-за
+        # перезапуска. В обоих случаях в канал уже поздно, а владельцу
+        # рассказать стоит. Текст переписывается для него: тот, что лежит
+        # в черновике, написан для канала.
+        try:
+            fresh = classifier.classify(
+                text=draft["src_excerpt"] or "",
+                author=draft["src_author"] or "?",
+                channel_name=channel_name(channel),
+                owner_mentioned=False,
+                thread_replies=replies,
+                thread_excerpt=thread_excerpt,
+                audience="owner",
+            )
+            verdict = {**fresh, "cls": draft["cls"], "confidence": draft["confidence"]}
+            store.update_reply(draft_id, verdict["reply"])
+        except Exception:
+            log.exception("пересборка ответа %s для личку", draft_id)
+
+        hold(
+            draft_id,
+            verdict,
+            src_channel=channel,
+            src_ts=draft["src_ts"],
+            author=draft["src_author"] or "?",
+            excerpt=draft["src_excerpt"] or "",
+            thread_excerpt=thread_excerpt or ("ответ устарел, пока бот не работал" if stale else ""),
+        )
+        return
+
+    autopost(
+        draft_id,
+        verdict,
+        src_channel=channel,
+        src_ts=draft["src_ts"],
+        thread_ts=draft["src_thread_ts"],
+        author=draft["src_author"] or "?",
+        excerpt=draft["src_excerpt"] or "",
+    )
+
+
+def recover_delayed() -> None:
+    """Разобраться с отложенными ответами, пережившими перезапуск.
+
+    Без этого они остались бы в базе навсегда: таймер жил в памяти
+    процесса, которого больше нет, и ответ не ушёл бы ни в канал, ни в
+    личку — молча пропал бы.
+    """
+    stuck = store.delayed()
+    for draft in stuck:
+        deliver(draft["id"])
+    if stuck:
+        log.info("разобрал %s отложенных ответов после перезапуска", len(stuck))
 
 
 def undo(draft) -> str:
@@ -542,6 +657,9 @@ def process_channel_message(event: dict) -> None:
         return
 
     if should_autopost(cls, verdict["confidence"]):
+        if REPLY_DELAY > 0:
+            schedule_reply(draft_id)
+            return
         autopost(
             draft_id,
             verdict,
@@ -926,6 +1044,7 @@ if __name__ == "__main__":
         ", ".join(sorted(TEST_CHANNELS)) or "нет",
     )
 
+    recover_delayed()
     backfill()
     threading.Thread(target=scheduler, daemon=True, name="glebot-scheduler").start()
 
