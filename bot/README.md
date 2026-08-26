@@ -101,6 +101,26 @@ bot\requirements.txt`, `python bot\app.py`. Экспортировать пер�
 истории за 24 ч завершён». Если добор молчит, а каналы не пустые, проверь
 пункт 5: скорее всего бота не позвали в канал.
 
+### Автозапуск в Windows
+
+Пока бот запускается командой в терминале, окно приходится держать
+открытым, а после перезагрузки — вводить команду заново. Рядом лежат две
+обёртки: `bot/glebot.cmd` (запуск из корня репозитория с дописыванием в
+`glebot.log`) и `bot/glebot-hidden.vbs` (то же самое без консольного окна).
+
+Ярлык в автозапуске, одной командой в PowerShell, права администратора не
+нужны:
+
+```powershell
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Glebot.lnk")
+$s.TargetPath = "wscript.exe"
+$s.Arguments = '"D:\Claude_agents\Cloudot\glebot-hidden.vbs"'
+$s.Save()
+```
+
+Убрать — удалить `Glebot.lnk` из папки, которая открывается по `shell:startup`.
+Посмотреть, жив ли бот, — по хвосту лога: `Get-Content glebot.log -Tail 5`.
+
 ### Где это держать
 
 Socket Mode не требует публичного адреса и входящего трафика, поэтому годится
