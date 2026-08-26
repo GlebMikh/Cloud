@@ -818,6 +818,67 @@ def test_delay_survives_restart():
         app.REPLY_DELAY = saved_delay
 
 
+def last_decision():
+    return store.decisions(1)[0]
+
+
+def test_decision_journal():
+    """Молчание должно быть объяснимым.
+
+    Бот молчит по доброму десятку причин, и снаружи все они выглядят
+    одинаково. Пока причина не записана, единственный доступный ответ на
+    «почему он не ответил?» — пожать плечами.
+    """
+    clear_pending()
+    fake.reset()
+    app.classifier.classify = lambda **kw: {
+        "cls": "DISCUSSION", "confidence": "высокая",
+        "reason": "трёп про пятницу", "reply": "", "jira_summary": "",
+    }
+    app.process_channel_message(incoming("2500.000100", "ну и пятница выдалась, конечно"))
+    app.classifier.classify = fake_classify
+
+    row = last_decision()
+    assert row["cls"] == "DISCUSSION", dict(row)
+    assert row["outcome"] == "класс не требует ответа", dict(row)
+    assert "пятницу" in (row["reason"] or "")
+    ok("отказ отвечать записан вместе с классом и причиной")
+
+
+def test_empty_reply_retried():
+    """Класс требует ответа, а ответа нет — это промах модели, не решение.
+
+    Первая версия молча пропускала такое: сообщение помечалось разобранным,
+    и баг-репорт исчезал без следа. Одна повторная попытка дешевле.
+    """
+    clear_pending()
+    fake.reset()
+    attempts = []
+
+    def flaky(**kw):
+        attempts.append(kw)
+        if len(attempts) == 1:
+            return dict(VERDICT, reply="")      # промах
+        return dict(VERDICT)                    # со второй попытки текст есть
+
+    app.classifier.classify = flaky
+    app.process_channel_message(incoming("2600.000100"))
+    app.classifier.classify = fake_classify
+
+    assert len(attempts) == 2, f"повторной попытки не было: {len(attempts)}"
+    assert fake.to_inbox(), "после удачной второй попытки владелец ничего не получил"
+    ok("пустой ответ переспрашивается, а не теряется молча")
+
+    # А если и вторая пустая — это записывается, а не исчезает.
+    fake.reset()
+    app.classifier.classify = lambda **kw: dict(VERDICT, reply="")
+    app.process_channel_message(incoming("2700.000100"))
+    app.classifier.classify = fake_classify
+    assert not fake.posted
+    assert last_decision()["outcome"].startswith("модель не дала текста"), last_decision()["outcome"]
+    ok("две пустые попытки подряд оставляют запись в журнале")
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),
@@ -845,6 +906,8 @@ TESTS = [
     ("живой успел раньше", test_delay_yields_to_human),
     ("владелец ответил сам", test_delay_owner_answered),
     ("пауза переживает перезапуск", test_delay_survives_restart),
+    ("журнал решений", test_decision_journal),
+    ("пустой ответ модели", test_empty_reply_retried),
 ]
 
 

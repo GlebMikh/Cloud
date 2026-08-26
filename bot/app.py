@@ -603,12 +603,35 @@ def process_channel_message(event: dict) -> None:
         log.exception("classify")
         return
 
-    # Разобрано — независимо от вердикта. Метка-реакция ляжет только на то,
-    # из чего вышел черновик, а заплачено уже за всё: без этой записи добор
-    # истории при следующем старте прогонит через модель те же сутки заново.
-    store.mark_seen(channel, event["ts"])
-
     cls = verdict["cls"]
+
+    # Класс требует ответа, а ответа нет — это промах модели, а не решение
+    # промолчать. Одна повторная попытка дешевле, чем потерянный баг-репорт;
+    # если и она пустая, об этом будет видно в журнале решений.
+    if cls in classifier.ACTIONABLE and not verdict["reply"].strip():
+        log.warning("%s без текста ответа — пробую ещё раз", cls)
+        try:
+            verdict = classifier.classify(
+                text=text,
+                author=author,
+                channel_name=channel_name(channel),
+                owner_mentioned=owner_mentioned,
+                thread_replies=replies,
+                thread_excerpt=thread_excerpt,
+                owner_replied_in_thread=owner_replied,
+                audience="owner" if held else "channel",
+            )
+            cls = verdict["cls"]
+        except Exception:
+            log.exception("повторный разбор")
+
+    def remember(outcome: str) -> None:
+        """Записать разбор вместе с тем, чем он кончился."""
+        store.mark_seen(
+            channel, event["ts"], cls=cls, confidence=verdict["confidence"],
+            reason=verdict.get("reason", ""), outcome=outcome,
+        )
+
     log.info(
         "%s / %s — %s (кеш %s токенов)",
         cls,
@@ -617,13 +640,21 @@ def process_channel_message(event: dict) -> None:
         verdict.get("_usage", {}).get("cached", "?"),
     )
 
-    if cls not in classifier.ACTIONABLE or not verdict["reply"].strip():
+    if cls not in classifier.ACTIONABLE:
+        remember("класс не требует ответа")
+        return
+    if not verdict["reply"].strip():
+        remember("модель не дала текста ответа даже со второй попытки")
         return
     if cls != "MENTION":
         if owner_replied or replies >= SKIP_THREAD_IF_REPLIES_GTE:
+            remember("в треде уже идёт разговор")
             return
         if verdict["confidence"] == "низкая" and cls != "BUG":
+            remember("низкая уверенность — не рискую")
             return
+
+    remember("held" if held else ("автоответ" if should_autopost(cls, verdict["confidence"]) else "карточка"))
 
     # Метка ставится до отправки карточки: оборвавшийся после метки процесс
     # промолчит, оборвавшийся до неё — продублирует карточку, и второе хуже.

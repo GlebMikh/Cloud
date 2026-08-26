@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS seen (
     channel TEXT NOT NULL,
     ts      TEXT NOT NULL,
     at      REAL NOT NULL,
+    -- Вердикт, а не только факт разбора. Молчание бота выглядит одинаково,
+    -- что бы за ним ни стояло: болтовня, пустой ответ модели, потолок
+    -- вызовов. Без записанного решения ответить на «почему он промолчал?»
+    -- нечем — а спрашивают об этом первым делом.
+    cls        TEXT,
+    confidence TEXT,
+    reason     TEXT,
+    outcome    TEXT,
     PRIMARY KEY (channel, ts)
 );
 """
@@ -74,6 +82,10 @@ def init() -> None:
         for column in ("posted_channel", "posted_ts"):
             if column not in existing:
                 conn.execute(f"ALTER TABLE drafts ADD COLUMN {column} TEXT")
+        seen_columns = {row[1] for row in conn.execute("PRAGMA table_info(seen)")}
+        for column in ("cls", "confidence", "reason", "outcome"):
+            if column not in seen_columns:
+                conn.execute(f"ALTER TABLE seen ADD COLUMN {column} TEXT")
 
 
 def already_seen(channel: str, ts: str) -> bool:
@@ -97,13 +109,27 @@ def already_seen(channel: str, ts: str) -> bool:
     return row is not None
 
 
-def mark_seen(channel: str, ts: str) -> None:
-    """Запомнить, что сообщение уже проходило через классификатор."""
+def mark_seen(channel: str, ts: str, *, cls: str = "", confidence: str = "",
+              reason: str = "", outcome: str = "") -> None:
+    """Запомнить разбор сообщения вместе с вердиктом.
+
+    Вердикт нужен не для работы, а для объяснимости: бот молчит по доброму
+    десятку причин, и снаружи все они выглядят одинаково.
+    """
     with _connect() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO seen (channel, ts, at) VALUES (?, ?, ?)",
-            (channel, ts, time.time()),
+            "INSERT OR REPLACE INTO seen (channel, ts, at, cls, confidence, reason, outcome) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (channel, ts, time.time(), cls, confidence, reason, outcome),
         )
+
+
+def decisions(limit: int = 20) -> list[sqlite3.Row]:
+    """Последние решения бота — новые первыми."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM seen ORDER BY at DESC LIMIT ?", (limit,)
+        ).fetchall()
 
 
 def purge_seen_older_than(days: float) -> int:
