@@ -54,6 +54,8 @@ class FakeClient:
         self.posted = []       # (channel, thread_ts, text)
         self.reactions = []    # (channel, ts, name)
         self.thread_replies = {}
+        self.deleted = []
+        self.updated = []
         self._ts = 1000
 
     def _next_ts(self) -> str:
@@ -82,6 +84,14 @@ class FakeClient:
         self.posted.append((landed, thread_ts, text))
         return {"channel": landed, "ts": self._next_ts()}
 
+    def chat_delete(self, channel, timestamp):
+        self.deleted.append((channel, timestamp))
+        return {"ok": True}
+
+    def chat_update(self, channel, ts, text):
+        self.updated.append((channel, ts, text))
+        return {"ok": True}
+
     def reactions_add(self, channel, timestamp, name):
         self.reactions.append((channel, timestamp, name))
         return {"ok": True}
@@ -97,6 +107,8 @@ class FakeClient:
     def reset(self):
         self.posted.clear()
         self.reactions.clear()
+        self.deleted.clear()
+        self.updated.clear()
 
 
 class FakeApp:
@@ -355,6 +367,184 @@ def test_ignores_others_in_inbox():
     ok("решения принимаются только от владельца и только от живых сообщений")
 
 
+def clear_pending():
+    """Закрыть всё, что осталось ждать от предыдущих проверок.
+
+    Проверки автоответа считают ждущие карточки, а предыдущие сценарии
+    оставляют свои — без уборки тест ловил бы чужой хвост.
+    """
+    for row in store.awaiting():
+        store.resolve(row["id"], "dropped")
+    # И отправленные автоответы тоже: «нет» без номера относится к
+    # последнему, и чужой недавний ответ сделал бы адресата неоднозначным.
+    for row in store.recently_posted():
+        store.resolve(row["id"], "dropped")
+
+
+def autopost_mode(classes="MENTION,BUG,TASK,QUESTION", minimum="средняя"):
+    """Включить автоответ на время одной проверки."""
+    saved = (app.AUTOPOST_CLASSES, app.AUTOPOST_MIN_CONFIDENCE)
+    app.AUTOPOST_CLASSES = {c.strip() for c in classes.split(",") if c.strip()}
+    app.AUTOPOST_MIN_CONFIDENCE = minimum
+    return saved
+
+
+def restore_mode(saved):
+    app.AUTOPOST_CLASSES, app.AUTOPOST_MIN_CONFIDENCE = saved
+
+
+def test_autopost():
+    """Режим автоответа: сначала в тред, потом сводка владельцу."""
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("1000.000100"))
+
+        published = fake.to_channel()
+        assert len(published) == 1, fake.posted
+        assert published[0][1] == "1000.000100", "ответ ушёл не в тред исходного сообщения"
+        assert published[0][2].startswith(app.PREFIX)
+        ok("ответ ушёл в канал сразу, без одобрения")
+
+        notice = fake.to_inbox()
+        assert len(notice) == 1, fake.posted
+        assert "Ответил сам" in notice[0][2]
+        assert "Черновик тикета" in notice[0][2], "в сводке нет заготовки задачи"
+        assert "удалить мой ответ" in notice[0][2], "в сводке не сказано, как отменить"
+        ok("в личку пришла сводка с черновиком тикета и способом отменить")
+
+        assert not store.awaiting(), "автоответ не должен оставлять карточку в ожидании"
+        posted = store.recently_posted()
+        assert len(posted) == 1 and posted[0]["posted_ts"], "координаты ответа не сохранены"
+        ok("черновик закрыт как отправленный, координаты ответа сохранены")
+    finally:
+        restore_mode(saved)
+
+
+def test_autopost_undo_by_reaction():
+    """❌ на сводке убирает сказанное из треда — это главная страховка режима."""
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("1100.000100"))
+        draft = store.recently_posted()[0]
+        fake.reset()
+
+        app.on_reaction({
+            "user": OWNER, "reaction": "x",
+            "item": {"channel": draft["card_channel"], "ts": draft["card_ts"]},
+        })
+        assert fake.deleted == [(CHANNEL, draft["posted_ts"])], fake.deleted
+        assert store.by_id(draft["id"])["status"] == "undone"
+        assert "Удалил свой ответ" in fake.to_inbox()[0][2]
+        ok("реакция ❌ удаляет ответ из треда и подтверждает это")
+    finally:
+        restore_mode(saved)
+
+
+def test_autopost_undo_by_word():
+    """«Нет» словом в личке относится к последнему автоответу."""
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("1200.000100"))
+        draft = store.recently_posted()[0]
+        fake.reset()
+
+        app.handle_inbox({"user": OWNER, "channel": INBOX, "ts": "990.1", "text": "нет"})
+        assert fake.deleted == [(CHANNEL, draft["posted_ts"])], fake.deleted
+        assert store.by_id(draft["id"])["status"] == "undone"
+        ok("«нет» без номера отменяет последний автоответ")
+
+        # А если недавних автоответов несколько — угадывать нельзя: удалить
+        # не тот ответ хуже, чем переспросить.
+        fake.reset()
+        app.process_channel_message(incoming("1210.000100"))
+        app.process_channel_message(incoming("1220.000100", "Второй баг: не грузится аватар"))
+        fake.reset()
+        app.handle_inbox({"user": OWNER, "channel": INBOX, "ts": "990.2", "text": "нет"})
+        assert not fake.deleted, "при двух свежих автоответах бот удалил наугад"
+        assert "не понял, про какую речь" in fake.to_inbox()[0][2]
+        ok("при нескольких свежих автоответах бот переспрашивает, а не удаляет наугад")
+    finally:
+        restore_mode(saved)
+
+
+def test_autopost_rewrite():
+    """Правка меняет уже отправленное сообщение, а не досылает второе."""
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("1300.000100"))
+        draft = store.recently_posted()[0]
+        fake.reset()
+
+        app.classifier.classify = lambda **kw: dict(VERDICT, reply="Баг, передаю Глебу.")
+        app.handle_inbox({"user": OWNER, "channel": INBOX, "ts": "991.1",
+                          "text": "покороче и без «похоже»"})
+        app.classifier.classify = fake_classify
+
+        assert not fake.to_channel(), "правка досылает второе сообщение вместо замены"
+        assert fake.updated and fake.updated[0][1] == draft["posted_ts"], fake.updated
+        assert "Баг, передаю Глебу." in fake.updated[0][2]
+        assert store.by_id(draft["id"])["reply_text"] == "Баг, передаю Глебу."
+        ok("правка редактирует сообщение прямо в треде")
+    finally:
+        restore_mode(saved)
+
+
+def test_autopost_ticket():
+    """🎫 на сводке заводит тикет по уже отправленному ответу."""
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.process_channel_message(incoming("1400.000100"))
+        draft = store.recently_posted()[0]
+        fake.reset()
+
+        app.on_reaction({
+            "user": OWNER, "reaction": "ticket",
+            "item": {"channel": draft["card_channel"], "ts": draft["card_ts"]},
+        })
+        answer = fake.to_inbox()[0][2]
+        assert "Jira не настроена" in answer, answer
+        assert store.by_id(draft["id"])["status"] == "posted", "ответ не должен отзываться"
+        ok("🎫 без настроенной Jira честно сообщает и не трогает отправленное")
+    finally:
+        restore_mode(saved)
+
+
+def test_autopost_low_confidence_asks():
+    """Сомнительный разбор идёт прежним путём — через одобрение.
+
+    Ошибка автоответа видна не владельцу, а всему каналу, поэтому порог
+    уверенности здесь не украшение: он единственный, что отделяет
+    «бот иногда отвечает лишнее» от «бот иногда позорит владельца».
+    """
+    saved = autopost_mode(minimum="высокая")
+    try:
+        clear_pending()
+        fake.reset()
+        app.classifier.classify = lambda **kw: dict(VERDICT, confidence="средняя")
+        app.process_channel_message(incoming("1500.000100"))
+        app.classifier.classify = fake_classify
+
+        assert not fake.to_channel(), "разбор ниже порога ушёл в канал сам"
+        assert "Черновик" in fake.to_inbox()[0][2], "не пришла карточка на одобрение"
+        assert len(store.awaiting()) == 1
+        ok("уверенность ниже порога возвращает обычный режим одобрения")
+
+        for row in store.awaiting():
+            store.resolve(row["id"], "dropped")
+    finally:
+        restore_mode(saved)
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),
@@ -367,6 +557,12 @@ TESTS = [
     ("правка черновика", test_revision),
     ("несколько ждущих карточек", test_ambiguous_decision),
     ("чужие сообщения в инбоксе", test_ignores_others_in_inbox),
+    ("автоответ без одобрения", test_autopost),
+    ("отмена автоответа реакцией", test_autopost_undo_by_reaction),
+    ("отмена автоответа словом", test_autopost_undo_by_word),
+    ("правка отправленного", test_autopost_rewrite),
+    ("тикет по автоответу", test_autopost_ticket),
+    ("низкая уверенность спрашивает", test_autopost_low_confidence_asks),
 ]
 
 

@@ -70,6 +70,18 @@ WATCH = {c.strip() for c in os.environ.get("WATCH_CHANNELS", "").split(",") if c
 DIGEST = {c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()}
 MARKER = os.environ.get("MARKER_EMOJI", "robot_face")
 AUTO_REPLY_ON_MENTION = os.environ.get("AUTO_REPLY_ON_MENTION", "false").lower() == "true"
+# Классы, на которые бот отвечает сам, не спрашивая. Пусто — прежний режим,
+# когда в канал не уходит ни слова без «ок». `AUTO_REPLY_ON_MENTION=true`
+# из старых настроек означает то же самое для одного класса MENTION.
+AUTOPOST_CLASSES = {
+    c.strip().upper()
+    for c in os.environ.get("AUTOPOST_CLASSES", "MENTION" if AUTO_REPLY_ON_MENTION else "").split(",")
+    if c.strip()
+}
+# Ниже этой уверенности бот всё равно спрашивает: цена ошибки автоответа —
+# не потраченное внимание владельца, а чужие глаза в рабочем канале.
+AUTOPOST_MIN_CONFIDENCE = os.environ.get("AUTOPOST_MIN_CONFIDENCE", "средняя").strip().lower()
+CONFIDENCE_RANK = {"низкая": 1, "средняя": 2, "высокая": 3}
 # Сколько часов истории добрать при старте. Slack не переигрывает пропущенные
 # события: всё, что произошло, пока процесс лежал, для него не существует.
 # Добор при старте — единственное, что закрывает эту дыру.
@@ -171,6 +183,127 @@ def send_card(draft_id: str, verdict: dict, *, src_channel: str, src_ts: str,
     )
     posted = app.client.chat_postMessage(channel=OWNER, text=text)
     store.attach_card(draft_id, posted["channel"], posted["ts"])
+
+
+# --------------------------------------------------------------------------
+# автоответ: сначала отвечаем, потом отчитываемся
+# --------------------------------------------------------------------------
+
+def should_autopost(cls: str, confidence: str) -> bool:
+    """Отвечать ли самому, не спрашивая.
+
+    Уверенность — единственный порог, который здесь имеет смысл. Ошибка
+    автоответа видна не владельцу, а всему каналу, поэтому сомнительный
+    разбор идёт прежним путём: карточка, одобрение, только потом ответ.
+    """
+    if cls not in AUTOPOST_CLASSES:
+        return False
+    return CONFIDENCE_RANK.get(confidence, 0) >= CONFIDENCE_RANK.get(AUTOPOST_MIN_CONFIDENCE, 2)
+
+
+def autopost(draft_id: str, verdict: dict, *, src_channel: str, src_ts: str,
+             thread_ts: str | None, author: str, excerpt: str) -> None:
+    """Ответить в тред самому и отчитаться владельцу постфактум.
+
+    Порядок именно такой: сначала ответ, потом запись координат, потом
+    сводка. Если процесс оборвётся между шагами, худшее, что случится, —
+    владелец не увидит сводку о честно отправленном ответе; обратный
+    порядок дал бы сводку о том, чего в канале нет.
+    """
+    posted = app.client.chat_postMessage(
+        channel=src_channel,
+        thread_ts=thread_ts or src_ts,
+        text=f"{PREFIX} {verdict['reply']}",
+    )
+    store.mark_posted(draft_id, src_channel, posted["ts"])
+    store.resolve(draft_id, "posted")
+
+    notice = app.client.chat_postMessage(
+        channel=OWNER,
+        text=filters.notice_text(
+            draft_id,
+            verdict,
+            channel=channel_name(src_channel),
+            author=author,
+            excerpt=excerpt,
+            link=permalink(src_channel, src_ts),
+            jira_project=jira.PROJECT_KEY,
+            jira_issue_type=jira.ISSUE_TYPE_BUG,
+        ),
+    )
+    store.attach_card(draft_id, notice["channel"], notice["ts"])
+    log.info("ответил сам в #%s (%s)", channel_name(src_channel), draft_id)
+
+
+def undo(draft) -> str:
+    """Убрать из треда то, что бот сказал от имени владельца."""
+    if not draft["posted_ts"]:
+        return "Нечего отменять: в канал ничего не уходило."
+    try:
+        app.client.chat_delete(channel=draft["posted_channel"], timestamp=draft["posted_ts"])
+    except Exception as exc:
+        log.exception("удаление ответа %s", draft["id"])
+        return f"Не смог удалить ответ: {exc}. Удали руками в треде."
+    store.resolve(draft["id"], "undone")
+    return "Удалил свой ответ из треда."
+
+
+def make_ticket(draft) -> str:
+    """Завести тикет по уже отправленному ответу."""
+    if not draft["jira_summary"]:
+        return "Заготовки тикета для этого сообщения нет."
+    if draft["jira_key"]:
+        return f"Тикет уже заведён: {draft['jira_key']}."
+    if not jira.configured():
+        return "Jira не настроена — тикет не завёл. Нужны JIRA_EMAIL и JIRA_API_TOKEN в .env."
+    try:
+        link = permalink(draft["src_channel"], draft["src_ts"])
+        key = jira.create_bug(
+            draft["jira_summary"],
+            f"Откуда: Slack, #{channel_name(draft['src_channel'])}, {draft['src_author']}\n"
+            f"{link}\n\n"
+            f"Что происходит\n{draft['src_excerpt']}\n\n"
+            f"Заведено Глеботом из обсуждения в Slack, детали — по ссылке выше.",
+        )
+    except Exception as exc:
+        log.exception("Jira")
+        return f"Тикет завести не вышло: {exc}"
+    store.attach_ticket(draft["id"], key)
+    return f"Завёл {key}."
+
+
+def rewrite_posted(draft, instruction: str) -> str:
+    """Переписать уже отправленный ответ прямо в треде.
+
+    Правка редактирует существующее сообщение, а не досылает второе:
+    в рабочем канале две реплики подряд от бота выглядят хуже одной
+    неточной.
+    """
+    try:
+        verdict = classifier.classify(
+            text=draft["src_excerpt"] or "",
+            author=draft["src_author"] or "?",
+            channel_name=channel_name(draft["src_channel"]),
+            owner_mentioned=True,
+            thread_replies=0,
+            thread_excerpt=f"Владелец просит переписать уже отправленный ответ так: {instruction}",
+        )
+    except Exception:
+        log.exception("правка отправленного %s", draft["id"])
+        return "Не смог переписать — попробуй ещё раз."
+
+    try:
+        app.client.chat_update(
+            channel=draft["posted_channel"],
+            ts=draft["posted_ts"],
+            text=f"{PREFIX} {verdict['reply']}",
+        )
+    except Exception as exc:
+        log.exception("обновление ответа %s", draft["id"])
+        return f"Не смог поправить сообщение в треде: {exc}"
+
+    store.update_reply(draft["id"], verdict["reply"])
+    return f"Поправил в треде: «{verdict['reply'][:200]}»"
 
 
 # --------------------------------------------------------------------------
@@ -319,19 +452,15 @@ def process_channel_message(event: dict) -> None:
         jira_summary=verdict.get("jira_summary", ""),
     )
 
-    if cls == "MENTION" and AUTO_REPLY_ON_MENTION:
-        app.client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts or event["ts"],
-            text=f"{PREFIX} {verdict['reply']}",
-        )
-        store.resolve(draft_id, "posted")
-        app.client.chat_postMessage(
-            channel=OWNER,
-            text=(
-                f":robot_face: Тебя тегнули в #{channel_name(channel)} — ответил сам: "
-                f"«{verdict['reply'][:150]}»\n{permalink(channel, event['ts'])}"
-            ),
+    if should_autopost(cls, verdict["confidence"]):
+        autopost(
+            draft_id,
+            verdict,
+            src_channel=channel,
+            src_ts=event["ts"],
+            thread_ts=thread_ts,
+            author=author,
+            excerpt=text,
         )
         return
 
@@ -372,10 +501,19 @@ def resolve_target(decision: dict, channel: str, thread_ts: str | None):
     pending = store.awaiting()
     if len(pending) == 1:
         return pending[0], None, False
-    if not pending:
-        return None, None, False
+    if pending:
+        return None, pending, False
 
-    return None, pending, False
+    # 4. Ничего не ждёт решения, но бот недавно отвечал сам. «Нет», сказанное
+    # сразу после сводки, относится к ней — иначе отменить автоответ можно
+    # было бы только реакцией, а с телефона это лишний жест.
+    recent = store.recently_posted()
+    if len(recent) == 1:
+        return recent[0], None, False
+    if recent:
+        return None, recent, False
+
+    return None, None, False
 
 
 def describe(draft) -> str:
@@ -424,6 +562,23 @@ def handle_inbox(event: dict) -> None:
 
     if draft is None:
         return  # ничего не ждёт решения — это просто заметка себе
+
+    # Ответ уже в канале — значит словом можно отменить его, довести до
+    # тикета или переписать прямо в треде.
+    if draft["status"] == "posted" and draft["posted_ts"]:
+        action = decision["action"]
+        instruction = decision["text"] if matched_by_id else decision["original"]
+        if action == "reject":
+            respond(undo(draft))
+        elif action == "ticket":
+            respond(make_ticket(draft))
+        elif action == "approve":
+            respond("Этот ответ уже в треде — отменить можно словом «нет» или ❌.")
+        elif action == "unclear":
+            respond(f"{describe(draft)}\nОтвет уже отправлен. Отменить, завести тикет или переписать?")
+        else:
+            respond(rewrite_posted(draft, instruction))
+        return
 
     if draft["status"] != "awaiting":
         respond(f"Карточка `{draft['id']}` уже закрыта: {draft['status']}.")
@@ -498,11 +653,23 @@ def on_reaction(event):
 
     item = event.get("item", {})
     draft = store.by_card(item.get("channel", ""), item.get("ts", ""))
-    if draft is None or draft["status"] != "awaiting":
+    if draft is None:
         return
 
     reaction = event.get("reaction", "")
     card_channel, card_ts = item["channel"], item["ts"]
+
+    # Сводка об уже отправленном ответе: значки означают не «сделать», а
+    # «переделать» — отменить сказанное или довести до тикета.
+    if draft["status"] == "posted":
+        if reaction in ("x", "no_entry_sign", "-1"):
+            reply_in_card(card_channel, card_ts, undo(draft))
+        elif reaction in ("ticket", "tickets"):
+            reply_in_card(card_channel, card_ts, make_ticket(draft))
+        return
+
+    if draft["status"] != "awaiting":
+        return
 
     if reaction in ("white_check_mark", "heavy_check_mark", "+1"):
         reply_in_card(card_channel, card_ts, publish(draft, with_ticket=False))
@@ -627,12 +794,12 @@ if __name__ == "__main__":
     store.init()
     log.info(
         "Глебот стартует · разбор через %s · модель %s · каналы %s · "
-        "авто-ответ на теги: %s · сводка в %s · добор %s ч",
+        "сам отвечает на: %s · сводка в %s · добор %s ч",
         "Anthropic API" if classifier.backend() == "api"
         else f"подписку Claude Code ({classifier.cli_path()})",
         classifier.MODEL,
         ", ".join(sorted(WATCH)) or "не заданы",
-        AUTO_REPLY_ON_MENTION,
+        ", ".join(sorted(AUTOPOST_CLASSES)) or "ничего, всё через одобрение",
         DIGEST_AT,
         BACKFILL_HOURS,
     )

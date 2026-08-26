@@ -117,6 +117,54 @@ def card_text(
     return "\n".join(lines)
 
 
+def notice_text(
+    draft_id: str,
+    verdict: dict,
+    *,
+    channel: str,
+    author: str,
+    excerpt: str,
+    link: str,
+    prefix_emoji: str = ":robot_face:",
+    jira_project: str = "",
+    jira_issue_type: str = "",
+) -> str:
+    """Сводка о том, что бот уже ответил сам.
+
+    Отличается от карточки не только словами, но и назначением. Карточка
+    просит решения и потому обязана быть полной. Здесь решение уже принято
+    ботом, и владельцу нужно за секунду понять, всё ли в порядке: что
+    произошло, что сказано от его имени и как это отменить. Поэтому цитата
+    короче, а последняя строка — про отмену, а не про одобрение.
+    """
+    head = f"{prefix_emoji} *Ответил сам* `{draft_id}` · {verdict['cls']}"
+    if verdict.get("confidence"):
+        head += f" · уверенность: {verdict['confidence']}"
+
+    quote = (excerpt or "").replace("\n", " ")[:180]
+    link_part = f" · <{link}|открыть тред>" if link else ""
+
+    lines = [
+        head,
+        f"*Канал:* #{channel} · *Автор:* {author}{link_part}",
+        f"> {quote}",
+        "",
+        f"*Ответил:* {verdict['reply']}",
+    ]
+    if verdict.get("jira_summary") and jira_project:
+        lines += [
+            "",
+            f"*Черновик тикета:* {jira_project} / {jira_issue_type} / "
+            f"«{verdict['jira_summary']}» — заведу по 🎫",
+        ]
+    lines += [
+        "",
+        "_❌ — удалить мой ответ из треда · 🎫 — завести тикет · "
+        "любой текст — перепишу отправленное._",
+    ]
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------
 # разбор решения владельца
 # --------------------------------------------------------------------------

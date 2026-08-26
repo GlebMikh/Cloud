@@ -87,10 +87,18 @@ def build_summary(digest_lines: list[str], expired_count: int) -> str | None:
             "SELECT COUNT(*) FROM drafts WHERE status = 'dropped' AND resolved_at > ?",
             (day_ago,),
         ).fetchone()[0]
+        # Отозванные автоответы считаем отдельно: это не «отменил черновик»,
+        # а «сказал и забрал слова назад», и владельцу важно видеть, как
+        # часто такое случается — по этому числу и решается, оставлять ли
+        # автоответ включённым.
+        undone = conn.execute(
+            "SELECT COUNT(*) FROM drafts WHERE status = 'undone' AND resolved_at > ?",
+            (day_ago,),
+        ).fetchone()[0]
 
     pending = store.awaiting()
 
-    if not (digest_lines or pending or posted or dropped or expired_count):
+    if not (digest_lines or pending or posted or dropped or expired_count or undone):
         return None
 
     parts = [":robot_face: *Сводка за сутки*"]

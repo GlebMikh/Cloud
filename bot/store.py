@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS drafts (
     jira_key      TEXT,
     card_channel  TEXT,
     card_ts       TEXT,
+    -- Координаты сообщения, которое бот отправил в канал. Нужны только в
+    -- режиме автоответа: пока владелец не одобряет заранее, единственное,
+    -- что делает автоответ безопасным, — возможность его отозвать, а для
+    -- этого надо знать, что именно и куда ушло.
+    posted_channel TEXT,
+    posted_ts      TEXT,
     resolved_at   REAL
 );
 -- Поиск идёт по карточке (пришла реакция — чей это черновик?)
@@ -61,6 +67,12 @@ def _connect() -> sqlite3.Connection:
 def init() -> None:
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        # База могла быть создана прошлой версией бота: столбцов автоответа
+        # в ней нет, а терять из-за этого висящие карточки нельзя.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(drafts)")}
+        for column in ("posted_channel", "posted_ts"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE drafts ADD COLUMN {column} TEXT")
 
 
 def already_seen(channel: str, ts: str) -> bool:
@@ -138,6 +150,23 @@ def attach_card(draft_id: str, channel: str, ts: str) -> None:
         )
 
 
+def mark_posted(draft_id: str, channel: str, ts: str) -> None:
+    """Запомнить, что и куда бот отправил, — чтобы было что отзывать."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE drafts SET posted_channel = ?, posted_ts = ? WHERE id = ?",
+            (channel, ts, draft_id),
+        )
+
+
+def attach_ticket(draft_id: str, jira_key: str) -> None:
+    """Записать заведённый тикет, не трогая статус черновика."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE drafts SET jira_key = ? WHERE id = ?", (jira_key, draft_id)
+        )
+
+
 def by_card(channel: str, ts: str) -> sqlite3.Row | None:
     with _connect() as conn:
         return conn.execute(
@@ -174,16 +203,36 @@ def by_id_prefix(prefix: str) -> sqlite3.Row | None:
         return None
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM drafts WHERE id LIKE ? AND status = 'awaiting'",
+            "SELECT * FROM drafts WHERE id LIKE ? AND status IN ('awaiting', 'posted')",
             (prefix + "%",),
         ).fetchall()
     return rows[0] if len(rows) == 1 else None
 
 
+def recently_posted(minutes: float = 120) -> list[sqlite3.Row]:
+    """Ответы, отправленные ботом самостоятельно за последнее время.
+
+    Нужны для разбора коротких реплик владельца в личке: «нет», сказанное
+    сразу после сводки, относится к ней, а не к пустоте. Окно ограничено
+    намеренно — вчерашний ответ отменять словом без номера опасно.
+    """
+    since = time.time() - minutes * 60
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM drafts WHERE status = 'posted' AND posted_ts IS NOT NULL "
+            "AND created_at > ? ORDER BY created_at DESC",
+            (since,),
+        ).fetchall()
+
+
 def resolve(draft_id: str, status: str, jira_key: str | None = None) -> None:
+    """Закрыть черновик. Уже записанный тикет при этом не теряется:
+    в режиме автоответа отмена ответа приходит после заведения тикета,
+    и затирать его ключ было бы враньём в сводке."""
     with _connect() as conn:
         conn.execute(
-            "UPDATE drafts SET status = ?, jira_key = ?, resolved_at = ? WHERE id = ?",
+            "UPDATE drafts SET status = ?, jira_key = COALESCE(?, jira_key), "
+            "resolved_at = ? WHERE id = ?",
             (status, jira_key, time.time(), draft_id),
         )
 
