@@ -22,6 +22,9 @@ OWNER, BOT, DEV = "U0BK99FCH7F", "U0BOTBOT", "U0DEVDEV"
 CHANNEL, INBOX = "C099240QR3N", "D0INBOX"
 
 # Окружение должно стоять до импорта app: модуль разбирает его при импорте.
+# Задаётся ВСЁ, на что тесты опираются, включая пустые значения: app.py
+# читает .env из корня репозитория, и без явных значений проверки начинают
+# зависеть от того, что владелец включил у себя на машине.
 os.environ.update(
     SLACK_BOT_TOKEN="xoxb-test",
     SLACK_APP_TOKEN="xapp-test",
@@ -31,6 +34,8 @@ os.environ.update(
     DIGEST_CHANNELS="",
     MARKER_EMOJI="robot_face",
     AUTO_REPLY_ON_MENTION="false",
+    AUTOPOST_CLASSES="",
+    AUTOPOST_MIN_CONFIDENCE="средняя",
 )
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-placeholder")
 
