@@ -21,7 +21,11 @@ import threading
 import time
 
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+# Адаптер на websocket-client, а не встроенный в slack_sdk: встроенный на
+# каждом разрыве сети — сон ноутбука, VPN, икота провайдера — сыплет в лог
+# «Failed to check the state of sock» каждые десять секунд и переподключается
+# неохотно. Этот делает то же самое молча и надёжно.
+from slack_bolt.adapter.socket_mode.websocket_client import SocketModeHandler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1079,4 +1083,16 @@ if __name__ == "__main__":
     backfill()
     threading.Thread(target=scheduler, daemon=True, name="glebot-scheduler").start()
 
-    SocketModeHandler(app, required_env("SLACK_APP_TOKEN")).start()
+    # Соединение переподключается само, но если рухнет весь клиент —
+    # DNS пропал вместе с сетью, истёк токен, что угодно, — бот обязан
+    # пробовать снова, а не умирать: он работает без присмотра, и его
+    # смерть заметят только по пропавшим карточкам.
+    while True:
+        try:
+            SocketModeHandler(app, required_env("SLACK_APP_TOKEN")).start()
+        except KeyboardInterrupt:
+            log.info("остановлен вручную")
+            break
+        except Exception:
+            log.exception("Socket Mode упал целиком — переподключаюсь через 30 секунд")
+            time.sleep(30)
