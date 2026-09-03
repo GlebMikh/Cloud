@@ -49,6 +49,29 @@ def meaningful_length(text: str) -> int:
     return len(MARKUP_RE.sub("", text).strip())
 
 
+def media_kinds(event: dict) -> str:
+    """Что приложено к сообщению — словами для модели.
+
+    Само вложение бот не открывает, но сам факт видео или скриншота меняет
+    разбор: на видео поломка уже показана, и переспрашивать «как
+    воспроизвести» после этого бессмысленно и раздражает. Модели нужно об
+    этом знать — она видит только текст. Живёт здесь, а не в app: чистая
+    функция без сети, её место рядом с остальным проверяемым кодом.
+    """
+    kinds = set()
+    for f in event.get("files") or []:
+        mime = (f.get("mimetype") or "").lower()
+        ftype = (f.get("filetype") or "").lower()
+        if mime.startswith("video") or ftype in ("mov", "mp4", "webm", "gif"):
+            kinds.add("видео")
+        elif mime.startswith("image") or ftype in ("png", "jpg", "jpeg", "heic"):
+            kinds.add("скриншот")
+        else:
+            kinds.add("файл")
+    order = ["видео", "скриншот", "файл"]
+    return ", ".join(k for k in order if k in kinds)
+
+
 def worth_classifying(event: dict, *, owner_id: str, bot_id: str,
                       include_owner: bool = False) -> bool:
     """Стоит ли тратить на это сообщение вызов модели.

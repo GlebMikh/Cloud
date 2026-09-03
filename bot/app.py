@@ -154,6 +154,24 @@ def bot_user_id() -> str:
 # вспомогательное
 # --------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=256)
+def slack_mention_for(email: str | None) -> str:
+    """Найти в Slack упоминание по почте из Jira, если получится.
+
+    Тег живого человека полезнее, чем имя строкой: тот, кто чинил баг,
+    увидит, что регресс вернулся к нему. Но почта в Jira может быть скрыта,
+    а пользователя в Slack — не найтись; тогда возвращаем пусто, и ответ
+    просто назовёт исполнителя по имени.
+    """
+    if not email:
+        return ""
+    try:
+        user = app.client.users_lookupByEmail(email=email)["user"]
+        return f"<@{user['id']}>"
+    except Exception:
+        return ""
+
+
 def channel_name(channel_id: str) -> str:
     try:
         return app.client.conversations_info(channel=channel_id)["channel"]["name"]
@@ -587,6 +605,7 @@ def process_channel_message(event: dict) -> None:
     owner_mentioned = OWNER in text
     thread_ts = event.get("thread_ts")
     replies, owner_replied, thread_excerpt = thread_state(channel, thread_ts)
+    media = filters.media_kinds(event)
 
     # Кто-то из команды уже отреагировал — значит работа началась без нас.
     # Третий голос в треде тут не помогает никому, а владельцу знать полезно:
@@ -607,6 +626,7 @@ def process_channel_message(event: dict) -> None:
             thread_excerpt=thread_excerpt,
             owner_replied_in_thread=owner_replied,
             audience="owner" if held else "channel",
+            media=media,
         )
     except classifier.RateLimited as limit:
         # Не ошибка, а решение: квота дороже одной карточки. Сообщение
@@ -636,10 +656,41 @@ def process_channel_message(event: dict) -> None:
                 thread_excerpt=thread_excerpt,
                 owner_replied_in_thread=owner_replied,
                 audience="owner" if held else "channel",
+                media=media,
             )
             cls = verdict["cls"]
         except Exception:
             log.exception("повторный разбор")
+
+    # Баг — единственный класс, ради которого стоит идти в Jira: там ищется
+    # прошлый такой же тикет, и если он есть, разбор переигрывается уже с
+    # ним. Тогда ответ ссылается на TEAMDEV-…, называет релиз и зовёт того,
+    # кто чинил, — вместо того чтобы описывать проблему заново. Лишний вызов
+    # модели тут оправдан: баги редки, а цена вопроса — не «ещё карточка», а
+    # «повторно пропущенный регресс».
+    if cls == "BUG" and jira.configured():
+        try:
+            matches = jira.find_similar(verdict.get("jira_summary") or text)
+        except Exception:
+            log.exception("поиск похожих тикетов")
+            matches = []
+        if matches:
+            jira_context = jira.describe_matches(matches)  # noqa: F841 — уходит в classify
+            mention = slack_mention_for(matches[0].get("assignee_email"))
+            if mention:
+                jira_context += f"\nчинившего можно тегнуть так: {mention}"
+            try:
+                verdict = classifier.classify(
+                    text=text, author=author, channel_name=channel_name(channel),
+                    owner_mentioned=owner_mentioned, thread_replies=replies,
+                    thread_excerpt=thread_excerpt, owner_replied_in_thread=owner_replied,
+                    audience="owner" if held else "channel", media=media,
+                    jira_context=jira_context,
+                )
+                cls = verdict["cls"]
+                log.info("баг обогащён похожими тикетами: %s", matches[0]["key"])
+            except Exception:
+                log.exception("повторный разбор с Jira-контекстом")
 
     def remember(outcome: str) -> None:
         """Записать разбор вместе с тем, чем он кончился."""

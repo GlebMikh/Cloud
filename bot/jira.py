@@ -86,12 +86,48 @@ def find_similar(summary: str, days: int = 30) -> list[dict]:
     response = requests.get(
         f"{BASE_URL}/rest/api/3/search/jql",
         auth=(EMAIL, TOKEN),
-        params={"jql": jql, "maxResults": 3, "fields": "summary"},
+        params={
+            "jql": jql,
+            "maxResults": 3,
+            # Не только заголовок: исполнитель и версия-фикс — то, ради чего
+            # бот вообще лезет в Jira. Ответ «баг чинили в TEAMDEV-695,
+            # заехало в 1.3.2, глянь, кто закрывал» без этих полей не собрать.
+            "fields": "summary,status,assignee,fixVersions,resolutiondate",
+        },
         timeout=20,
     )
     if response.status_code >= 300:
         return []
-    return [
-        {"key": issue["key"], "summary": issue["fields"]["summary"]}
-        for issue in response.json().get("issues", [])
-    ]
+    out = []
+    for issue in response.json().get("issues", []):
+        f = issue.get("fields", {})
+        assignee = f.get("assignee") or {}
+        out.append({
+            "key": issue["key"],
+            "summary": f.get("summary", ""),
+            "status": (f.get("status") or {}).get("name", ""),
+            "assignee_name": assignee.get("displayName", ""),
+            "assignee_email": assignee.get("emailAddress", ""),
+            "fix_versions": [v.get("name", "") for v in f.get("fixVersions") or []],
+            "resolved": (f.get("resolutiondate") or "")[:10],
+        })
+    return out
+
+
+def describe_matches(matches: list[dict]) -> str:
+    """Свернуть похожие тикеты в короткую справку для модели.
+
+    Пустая строка, если ничего похожего нет: тогда рубрика работает как
+    раньше, без ссылок на прошлое.
+    """
+    lines = []
+    for m in matches:
+        part = f"{m['key']} «{m['summary'][:80]}» — {m['status'] or 'статус неизвестен'}"
+        if m["fix_versions"]:
+            part += f", релиз {', '.join(m['fix_versions'])}"
+        if m["resolved"]:
+            part += f", закрыт {m['resolved']}"
+        if m["assignee_name"]:
+            part += f", чинил {m['assignee_name']}"
+        lines.append(part)
+    return "\n".join(lines)

@@ -67,6 +67,20 @@ def test_jira_optional():
     ok("не настроена — молчит, но не падает")
 
 
+def test_jira_matches_render():
+    """Похожие тикеты сворачиваются в справку с ключом, релизом и чинившим."""
+    matches = [{
+        "key": "TEAMDEV-695", "summary": "Карточки: замена приза не срабатывает",
+        "status": "Готово", "assignee_name": "Dmitry Antonov",
+        "assignee_email": "d@a.co", "fix_versions": ["1.3.2"], "resolved": "2026-08-06",
+    }]
+    line = jira.describe_matches(matches)
+    for needed in ("TEAMDEV-695", "Готово", "1.3.2", "2026-08-06", "Dmitry Antonov"):
+        assert needed in line, needed
+    assert jira.describe_matches([]) == ""
+    ok("справка по похожим тикетам собирается и пустой список даёт пусто")
+
+
 def test_rubric():
     rubric = classifier._rubric()
     assert len(rubric) > 3000, "рубрика подозрительно короткая"
@@ -268,6 +282,25 @@ def test_rate_cap():
     ok("потолок разборов в час срабатывает")
 
 
+def test_media_context():
+    """Вложение попадает в контекст модели как факт, а не содержимое.
+
+    На видео поломка уже показана, и без этого сигнала бот спрашивает «как
+    воспроизвести» после приложенного ролика — ровно то, что раздражает.
+    """
+    ev_video = {"files": [{"mimetype": "video/quicktime", "filetype": "mov"}]}
+    ev_shot = {"files": [{"mimetype": "image/png", "filetype": "png"}]}
+    ev_both = {"files": [{"mimetype": "video/mp4"}, {"mimetype": "image/jpeg"}]}
+    assert filters.media_kinds(ev_video) == "видео"
+    assert filters.media_kinds(ev_shot) == "скриншот"
+    assert filters.media_kinds(ev_both) == "видео, скриншот"
+    assert filters.media_kinds({}) == ""
+    ctx = classifier._context("текст", "Автор", "общий", False, 0, "", False, "channel", "видео")
+    assert ctx.get("вложения") == "видео", ctx
+    assert "вложения" not in classifier._context("т", "А", "о", False, 0, "", False)
+    ok("вид вложения определяется и уходит в контекст, пустой — не засоряет")
+
+
 def test_card():
     card = filters.card_text(
         "a1b2",
@@ -298,7 +331,9 @@ if __name__ == "__main__":
     for name, fn in [
         ("хранилище черновиков", test_store),
         ("jira без настройки", test_jira_optional),
+        ("справка по похожим тикетам", test_jira_matches_render),
         ("рубрика классификатора", test_rubric),
+        ("вложения в контексте", test_media_context),
         ("разбор вердикта модели", test_verdict_parsing),
         ("выбор бэкенда", test_backend_choice),
         ("потолок разборов в час", test_rate_cap),

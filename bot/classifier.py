@@ -303,7 +303,8 @@ def parse_verdict(text: str) -> dict:
 
 
 def _context(text, author, channel_name, owner_mentioned, thread_replies,
-             thread_excerpt, owner_replied_in_thread, audience="channel") -> dict:
+             thread_excerpt, owner_replied_in_thread, audience="channel",
+             media="", jira_context="") -> dict:
     context = {
         # Для кого пишется reply. В тред идёт ответ автору сообщения, в личку —
         # справка владельцу о том, что происходит без него. Это разные тексты,
@@ -320,8 +321,18 @@ def _context(text, author, channel_name, owner_mentioned, thread_replies,
         "владелец уже отвечал в треде": owner_replied_in_thread,
         "текст": text,
     }
+    if media:
+        # Факт вложения, а не его содержимое: бот файл не открывает. Но
+        # видео уже показывает воспроизведение — значит вопрос «как
+        # воспроизвести» отпадает, и рубрика на это опирается.
+        context["вложения"] = media
     if thread_excerpt:
         context["тред"] = thread_excerpt
+    if jira_context:
+        # Похожие тикеты из Jira: ключ, релиз, кто чинил. С этим ответ может
+        # сослаться на прошлый случай и позвать нужного человека, а не
+        # описывать проблему заново.
+        context["похожие тикеты в jira"] = jira_context
     return context
 
 
@@ -452,6 +463,8 @@ def classify(
     thread_excerpt: str = "",
     owner_replied_in_thread: bool = False,
     audience: str = "channel",
+    media: str = "",
+    jira_context: str = "",
 ) -> dict:
     """Вернуть решение по сообщению.
 
@@ -461,6 +474,6 @@ def classify(
     _check_rate()
     context = _context(
         text, author, channel_name, owner_mentioned, thread_replies,
-        thread_excerpt, owner_replied_in_thread, audience,
+        thread_excerpt, owner_replied_in_thread, audience, media, jira_context,
     )
     return _classify_api(context) if backend() == "api" else _classify_cli(context)
