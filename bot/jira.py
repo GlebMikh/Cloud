@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import requests
 
@@ -65,30 +66,45 @@ def create_bug(summary: str, description: str) -> str:
     return response.json()["key"]
 
 
-def find_similar(summary: str, days: int = 30) -> list[dict]:
-    """Поискать похожие тикеты, чтобы не плодить дубли.
+LOOKBACK_DAYS = int(os.environ.get("JIRA_LOOKBACK_DAYS", "180"))
+_WORD_RE = re.compile(r"[^\W\d_]{4,}", re.UNICODE)
 
-    Ищем по значимым словам заголовка. Пустой результат — не гарантия
-    отсутствия дубля, поэтому решение всё равно остаётся за владельцем.
+
+def find_similar(summary: str, days: int = LOOKBACK_DAYS) -> list[dict]:
+    """Поискать похожие тикеты, чтобы связать повтор с прошлым случаем.
+
+    Два урока, оплаченных реальным промахом на TEAMDEV-695.
+
+    Окно было 30 дней — а баг, про который в чате говорят «снова», чинили
+    как раз недели и месяцы назад. Поэтому по умолчанию 180 дней.
+
+    Слова искались все разом (`text ~ "a b c"` — это И), и репорт «замена
+    приза в карточках» не находил тикет «Баг иконки в Daily Cards»: общих
+    слов у них нет. Теперь ИЛИ по словам с усечением (`карточ*` ловит и
+    «карточки», и «карточках»), и находится по любому пересечению. Обратная
+    сторона — в выдачу попадает и лишнее, поэтому решает уже модель: список
+    для неё кандидатский, а не готовый ответ.
     """
     if not configured():
         return []
 
-    words = [w for w in summary.replace(":", " ").split() if len(w) > 3][:5]
+    words = {w.lower() for w in _WORD_RE.findall(summary)}
+    words -= {"баг", "ошибка", "проблема", "сайт", "прод", "снова", "опять"}
+    words = list(words)[:6]
     if not words:
         return []
 
-    text = " ".join(words).replace('"', "")
+    clause = " OR ".join(f'text ~ "{w}*"' for w in words)
     jql = (
         f'project = {PROJECT_KEY} AND created >= -{days}d '
-        f'AND text ~ "{text}" ORDER BY created DESC'
+        f'AND ({clause}) ORDER BY created DESC'
     )
     response = requests.get(
         f"{BASE_URL}/rest/api/3/search/jql",
         auth=(EMAIL, TOKEN),
         params={
             "jql": jql,
-            "maxResults": 3,
+            "maxResults": 8,
             # Не только заголовок: исполнитель и версия-фикс — то, ради чего
             # бот вообще лезет в Jira. Ответ «баг чинили в TEAMDEV-695,
             # заехало в 1.3.2, глянь, кто закрывал» без этих полей не собрать.
