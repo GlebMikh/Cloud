@@ -879,6 +879,48 @@ def test_empty_reply_retried():
     ok("две пустые попытки подряд оставляют запись в журнале")
 
 
+def test_watch_all_joined():
+    """Режим «везде, где бот участник»: любой канал разбирается, кроме
+    явно исключённых и сводочных."""
+    saved_all, saved_watch, saved_excl, saved_digest = (
+        app.WATCH_ALL_JOINED, app.WATCH, app.EXCLUDE, app.DIGEST,
+    )
+    app.WATCH_ALL_JOINED = True
+    app.WATCH = set()          # список пуст, а бот всё равно должен отвечать
+    app.EXCLUDE = {"C0FLOOD"}
+    app.DIGEST = {"C0DIGEST"}
+    try:
+        clear_pending()
+        fake.reset()
+        # Незнакомый канал, которого нет ни в одном списке.
+        app.process_channel_message(
+            {"channel": "C0NEW", "ts": "3000.000100", "user": DEV,
+             "text": "Профиль: не листается список эмблем и рамок"}
+        )
+        assert fake.to_inbox(), "в режиме «везде» новый канал остался без разбора"
+        ok("любой канал, где бот состоит, разбирается без правки конфига")
+
+        fake.reset()
+        app.process_channel_message(
+            {"channel": "C0FLOOD", "ts": "3001.000100", "user": DEV,
+             "text": "Профиль: не листается список эмблем и рамок"}
+        )
+        assert not fake.posted, "исключённый канал всё же разобрали"
+        ok("EXCLUDE-канал не трогается даже в режиме «везде»")
+
+        fake.reset()
+        app.process_channel_message(
+            {"channel": "C0DIGEST", "ts": "3002.000100", "user": DEV,
+             "text": "Профиль: не листается список эмблем и рамок"}
+        )
+        assert not fake.to_channel(), "в сводочный канал бот написал в тред"
+        ok("DIGEST-канал остаётся только для сводки")
+    finally:
+        app.WATCH_ALL_JOINED, app.WATCH = saved_all, saved_watch
+        app.EXCLUDE, app.DIGEST = saved_excl, saved_digest
+        clear_pending()
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),
@@ -908,6 +950,7 @@ TESTS = [
     ("пауза переживает перезапуск", test_delay_survives_restart),
     ("журнал решений", test_decision_journal),
     ("пустой ответ модели", test_empty_reply_retried),
+    ("режим «везде, где бот участник»", test_watch_all_joined),
 ]
 
 

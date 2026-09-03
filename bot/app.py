@@ -72,6 +72,15 @@ def required_env(name: str) -> str:
 OWNER = required_env("OWNER_SLACK_ID")
 WATCH = {c.strip() for c in os.environ.get("WATCH_CHANNELS", "").split(",") if c.strip()}
 DIGEST = {c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()}
+# Реагировать во всех каналах, где бот состоит, а не по фиксированному списку.
+# В Socket Mode Slack и так доставляет события только из каналов-участников,
+# поэтому «везде, где добавлен» — это просто «не фильтровать по списку»:
+# добавил бота в канал — он там работает, без правки конфига.
+# WATCH_CHANNELS при этом становится необязательным; пустой список означает
+# не «нигде», а «везде».
+WATCH_ALL_JOINED = os.environ.get("WATCH_ALL_JOINED", "true").lower() == "true"
+# Каналы, куда бот не лезет, даже будучи участником: болталки, флуд, личное.
+EXCLUDE = {c.strip() for c in os.environ.get("EXCLUDE_CHANNELS", "").split(",") if c.strip()}
 # Каналы для проверки бота в одиночку: здесь разбираются и сообщения самого
 # владельца. В рабочих каналах это было бы вредно — бот отвечал бы на слова
 # того, кому он помогает, — а в песочнице иначе просто нечем проверить.
@@ -557,8 +566,11 @@ def process_channel_message(event: dict) -> None:
     """
     channel = event.get("channel")
 
-    if channel not in WATCH:
-        # DIGEST-каналы в тред не обслуживаются — они попадают в сводку.
+    if channel in DIGEST or channel in EXCLUDE:
+        # DIGEST — только в сводку, в тред бот там не пишет. EXCLUDE —
+        # каналы, куда его звать не стоило: болталки и личное.
+        return
+    if not (WATCH_ALL_JOINED or channel in WATCH):
         return
     if not filters.worth_classifying(
         event,
@@ -988,6 +1000,38 @@ def safe_process(event: dict) -> None:
         log.exception("разбор %s / %s", event.get("channel"), event.get("ts"))
 
 
+def joined_channels() -> set[str]:
+    """Каналы, где бот состоит участником — публичные и приватные.
+
+    Живому потоку событий этот список не нужен: Slack сам шлёт события
+    только из каналов-участников. Нужен он добору истории при старте —
+    там некому подсказать, куда смотреть, кроме самого Slack.
+    """
+    found: set[str] = set()
+    cursor = None
+    try:
+        while True:
+            resp = app.client.users_conversations(
+                types="public_channel,private_channel",
+                exclude_archived=True,
+                limit=200,
+                cursor=cursor,
+            )
+            found.update(c["id"] for c in resp["channels"])
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception:
+        log.exception("не смог перечислить каналы бота")
+    return found
+
+
+def backfill_channels() -> set[str]:
+    """Где добирать историю: все каналы-участники или явный список."""
+    channels = (joined_channels() if WATCH_ALL_JOINED else set(WATCH)) | TEST_CHANNELS
+    return channels - DIGEST - EXCLUDE
+
+
 def backfill() -> None:
     """Разобрать историю, накопившуюся, пока процесс не работал.
 
@@ -1004,7 +1048,7 @@ def backfill() -> None:
     дальше смотрим на `latest_reply`.
     """
     oldest = time.time() - BACKFILL_HOURS * 3600
-    for channel in sorted(WATCH):
+    for channel in sorted(backfill_channels()):
         try:
             history = app.client.conversations_history(channel=channel, limit=50)[
                 "messages"
@@ -1072,7 +1116,8 @@ if __name__ == "__main__":
         "Anthropic API" if classifier.backend() == "api"
         else f"подписку Claude Code ({classifier.cli_path()})",
         classifier.MODEL,
-        ", ".join(sorted(WATCH)) or "не заданы",
+        "везде, где бот участник" + (f" (кроме {', '.join(sorted(EXCLUDE))})" if EXCLUDE else "")
+        if WATCH_ALL_JOINED else (", ".join(sorted(WATCH)) or "не заданы"),
         ", ".join(sorted(AUTOPOST_CLASSES)) or "ничего, всё через одобрение",
         DIGEST_AT,
         BACKFILL_HOURS,
