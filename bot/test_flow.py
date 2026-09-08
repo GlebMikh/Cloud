@@ -921,6 +921,38 @@ def test_watch_all_joined():
         clear_pending()
 
 
+def test_mention_only_channel():
+    """Канал «только по тегу»: молчок на всё, кроме прямого обращения.
+
+    #dev-кабан — разработчики там разбираются сами, и лишний голос бота
+    шум. Но «почти» не значит «никогда»: если позвали лично владельца,
+    среагировать надо.
+    """
+    devkaban = "C0AU59E1N9H"
+    saved_mo, saved_watch = app.MENTION_ONLY, app.WATCH
+    app.MENTION_ONLY = {devkaban}
+    app.WATCH = set(app.WATCH) | {devkaban}
+    try:
+        clear_pending()
+        fake.reset()
+        # Обычный вопрос разработчика — бот молчит и в модель не ходит.
+        before = len(CALLS)
+        app.process_channel_message({"channel": devkaban, "ts": "3000.0001",
+                                     "user": DEV, "text": "Мы прод растера уже настраиваем?"})
+        assert not fake.posted, "бот ответил на дев-вопрос в mention-only канале"
+        assert len(CALLS) == before, "зря сходил в модель на сообщении без тега"
+        ok("в mention-only канале обычное сообщение не разбирается вовсе")
+
+        # Прямой тег владельца — проходит как обычно.
+        app.process_channel_message({"channel": devkaban, "ts": "3001.0001",
+                                     "user": DEV, "text": f"<@{OWNER}> глянь плиз, это норм?"})
+        assert fake.posted, "прямой тег владельца в mention-only канале проглочен"
+        ok("прямой тег владельца в mention-only канале проходит")
+    finally:
+        app.MENTION_ONLY, app.WATCH = saved_mo, saved_watch
+        clear_pending()
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),

@@ -81,6 +81,11 @@ DIGEST = {c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if
 WATCH_ALL_JOINED = os.environ.get("WATCH_ALL_JOINED", "true").lower() == "true"
 # Каналы, куда бот не лезет, даже будучи участником: болталки, флуд, личное.
 EXCLUDE = {c.strip() for c in os.environ.get("EXCLUDE_CHANNELS", "").split(",") if c.strip()}
+# Каналы, где бот молчит на всё, КРОМЕ прямого тега владельца. Для мест вроде
+# #dev-кабан, где разработчики почти всегда разбираются сами и вмешательство
+# владельца нужно редко — но когда его зовут лично, среагировать всё равно
+# надо. Это мягче полного EXCLUDE: тот глушит и прямое обращение.
+MENTION_ONLY = {c.strip() for c in os.environ.get("MENTION_ONLY_CHANNELS", "").split(",") if c.strip()}
 # Каналы для проверки бота в одиночку: здесь разбираются и сообщения самого
 # владельца. В рабочих каналах это было бы вредно — бот отвечал бы на слова
 # того, кому он помогает, — а в песочнице иначе просто нечем проверить.
@@ -590,6 +595,10 @@ def process_channel_message(event: dict) -> None:
         return
     if not (WATCH_ALL_JOINED or channel in WATCH):
         return
+    # Канал «только по тегу»: разработчики там разбираются сами, и лишний
+    # голос бота — шум. Молчим на всё, пока не позвали лично владельца.
+    if channel in MENTION_ONLY and OWNER not in (event.get("text") or ""):
+        return
     if not filters.worth_classifying(
         event,
         owner_id=OWNER,
@@ -1078,9 +1087,14 @@ def joined_channels() -> set[str]:
 
 
 def backfill_channels() -> set[str]:
-    """Где добирать историю: все каналы-участники или явный список."""
+    """Где добирать историю: все каналы-участники или явный список.
+
+    Каналы «только по тегу» из добора исключены: их прошлые сообщения
+    разбирать смысла нет (тег владельца в старом сообщении уже неактуален),
+    а прогонять сутки чужой переписки через модель — только жечь квоту.
+    """
     channels = (joined_channels() if WATCH_ALL_JOINED else set(WATCH)) | TEST_CHANNELS
-    return channels - DIGEST - EXCLUDE
+    return channels - DIGEST - EXCLUDE - MENTION_ONLY
 
 
 def backfill() -> None:
