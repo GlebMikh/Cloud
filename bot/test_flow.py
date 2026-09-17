@@ -953,6 +953,52 @@ def test_mention_only_channel():
         clear_pending()
 
 
+def test_addressed_to_others():
+    """Тегнуты конкретные люди, а владелец — нет: вопрос к ним, не к боту.
+
+    Егор тегнул Kemhost и Дмитрия и спросил про сроки релиза — бот влез с
+    «передам Глебу». Это ответ не на тот вопрос: спросили не владельца.
+    """
+    saved = autopost_mode()
+    try:
+        clear_pending()
+        fake.reset()
+        app.classifier.classify = lambda **kw: dict(
+            VERDICT, cls="QUESTION", reply="Передам Глебу, вернусь с ответом.", jira_summary="")
+        app.process_channel_message(incoming(
+            "3000.000100", "<@U0DIMA> <@U0KEM> когда ждать релиз перков за обсидиан?"))
+        app.classifier.classify = fake_classify
+        assert not fake.posted, "бот ответил на вопрос, адресованный другим людям"
+        assert "адресовано" in (last_decision()["outcome"] or "")
+        ok("вопрос, тегнутый конкретным людям, бот пропускает и записывает почему")
+
+        # Модель при этом знает, кому адресовано.
+        seen = {}
+        app.classifier.classify = lambda **kw: seen.update(kw) or dict(VERDICT, cls="QUESTION")
+        app.process_channel_message(incoming("3001.000100", "<@U0DIMA> глянь плиз, что с релизом?"))
+        app.classifier.classify = fake_classify
+        assert seen.get("addressed_to"), "модели не сообщили, кому адресовано"
+        ok("модели передано, кому адресовано сообщение")
+
+        # Баг, тегнутый разработчику, — в тред нет, но владельцу черновик приходит.
+        fake.reset()
+        app.process_channel_message(incoming(
+            "3002.000100", "<@U0DIMA> в профиле опять не листается список эмблем"))
+        assert not fake.to_channel(), "бот влез в тред с багом, адресованным разработчику"
+        assert fake.to_inbox(), "черновик бага не дошёл до владельца"
+        assert "Не влез в тред" in fake.to_inbox()[0][2]
+        ok("баг, тегнутый разработчику, уходит владельцу в личку, а не в тред")
+
+        # Групповой тег адресацией не считается — разбор обычный.
+        fake.reset()
+        app.process_channel_message(incoming(
+            "3003.000100", "<!subteam^S09CVGYUHQV> в профиле не листается список эмблем"))
+        assert fake.to_channel(), "групповой тег заблокировал обычный разбор"
+        ok("групповой тег (@dev) не блокирует ответ")
+    finally:
+        restore_mode(saved)
+
+
 TESTS = [
     ("сообщение канала становится карточкой", test_message_to_card),
     ("повторная доставка события", test_duplicate_delivery),
@@ -983,6 +1029,7 @@ TESTS = [
     ("журнал решений", test_decision_journal),
     ("пустой ответ модели", test_empty_reply_retried),
     ("режим «везде, где бот участник»", test_watch_all_joined),
+    ("адресовано другим людям", test_addressed_to_others),
 ]
 
 

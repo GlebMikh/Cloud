@@ -304,7 +304,8 @@ def parse_verdict(text: str) -> dict:
 
 def _context(text, author, channel_name, owner_mentioned, thread_replies,
              thread_excerpt, owner_replied_in_thread, audience="channel",
-             media="", jira_context="") -> dict:
+             media="", jira_context="", channel_recent="", owner_spoke_recently=False,
+             addressed_to="") -> dict:
     context = {
         # Для кого пишется reply. В тред идёт ответ автору сообщения, в личку —
         # справка владельцу о том, что происходит без него. Это разные тексты,
@@ -319,8 +320,12 @@ def _context(text, author, channel_name, owner_mentioned, thread_replies,
         "владельца тегнули": owner_mentioned,
         "ответов в треде": thread_replies,
         "владелец уже отвечал в треде": owner_replied_in_thread,
+        "владелец недавно писал в этом канале": owner_spoke_recently,
         "текст": text,
     }
+    if addressed_to:
+        # Сообщение тегает конкретных людей (не владельца): вопрос к ним.
+        context["адресовано лично"] = addressed_to
     if media:
         # Факт вложения, а не его содержимое: бот файл не открывает. Но
         # видео уже показывает воспроизведение — значит вопрос «как
@@ -328,6 +333,10 @@ def _context(text, author, channel_name, owner_mentioned, thread_replies,
         context["вложения"] = media
     if thread_excerpt:
         context["тред"] = thread_excerpt
+    if channel_recent:
+        # Последние сообщения канала, не только этого треда. Владелец мог
+        # ответить рядом, а не в ветке, — и тогда лезть с ответом не нужно.
+        context["недавно в канале"] = channel_recent
     if jira_context:
         # Похожие тикеты из Jira: ключ, релиз, кто чинил. С этим ответ может
         # сослаться на прошлый случай и позвать нужного человека, а не
@@ -465,6 +474,9 @@ def classify(
     audience: str = "channel",
     media: str = "",
     jira_context: str = "",
+    channel_recent: str = "",
+    owner_spoke_recently: bool = False,
+    addressed_to: str = "",
 ) -> dict:
     """Вернуть решение по сообщению.
 
@@ -475,5 +487,6 @@ def classify(
     context = _context(
         text, author, channel_name, owner_mentioned, thread_replies,
         thread_excerpt, owner_replied_in_thread, audience, media, jira_context,
+        channel_recent, owner_spoke_recently, addressed_to,
     )
     return _classify_api(context) if backend() == "api" else _classify_cli(context)

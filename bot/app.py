@@ -16,6 +16,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -197,6 +198,31 @@ def permalink(channel: str, ts: str) -> str:
         return app.client.chat_getPermalink(channel=channel, message_ts=ts)["permalink"]
     except Exception:
         return ""
+
+
+def channel_context(channel: str, before_ts: str, limit: int = 8) -> tuple[str, bool]:
+    """Недавние сообщения канала до этого — и писал ли среди них владелец.
+
+    Тред — не весь контекст. Владелец часто отвечает на вопрос обычным
+    сообщением в канале, а не в ветке, и бот, глядящий только в тред,
+    этого не видит и лезет с ответом поверх уже сказанного. Здесь берётся
+    короткий хвост канала прямо перед разбираемым сообщением.
+    """
+    try:
+        msgs = app.client.conversations_history(
+            channel=channel, latest=before_ts, inclusive=False, limit=limit
+        )["messages"]
+    except Exception:
+        return "", False
+
+    owner_spoke = any(m.get("user") == OWNER for m in msgs)
+    # История отдаёт новые первыми — разворачиваем в порядок разговора.
+    excerpt = "\n".join(
+        f"{user_name(m.get('user', '?'))}: {(m.get('text') or '')[:160]}"
+        for m in reversed(msgs)
+        if (m.get("text") or "").strip() and not m.get("subtype")
+    )
+    return excerpt, owner_spoke
 
 
 def thread_state(channel: str, thread_ts: str | None) -> tuple[int, bool, str]:
@@ -614,6 +640,7 @@ def process_channel_message(event: dict) -> None:
     owner_mentioned = OWNER in text
     thread_ts = event.get("thread_ts")
     replies, owner_replied, thread_excerpt = thread_state(channel, thread_ts)
+    channel_recent, owner_spoke_recently = channel_context(channel, event["ts"])
     media = filters.media_kinds(event)
 
     # Кто-то из команды уже отреагировал — значит работа началась без нас.
@@ -623,20 +650,40 @@ def process_channel_message(event: dict) -> None:
     # треде уместно даже при чужих ответах, человек ждёт реакции на своё
     # обращение. Признак известен до классификации, поэтому маршрут можно
     # выбрать заранее — а от него зависит, для кого модель пишет текст.
-    held = bool(replies) and not owner_replied and not owner_mentioned
+    # Сообщение адресовано конкретным людям — тегнуты они, а не владелец.
+    # Тогда вопрос к ним, и «передам Глебу» от бота — это ответ не на тот
+    # вопрос: Егор спросил Kemhost и Дмитрия про сроки релиза, а бот влез
+    # с обещанием передать владельцу. Групповые теги (@dev, @here) сюда не
+    # входят: они не называют человека, и такие сообщения бот разбирает.
+    others = [
+        u for u in re.findall(r"<@(U[A-Z0-9]+)>", text)
+        if u not in (OWNER, bot_user_id())
+    ]
+    addressed_to_others = bool(others) and not owner_mentioned
+    addressed_names = ", ".join(user_name(u) for u in others[:4]) if addressed_to_others else ""
+
+    held = (bool(replies) and not owner_replied and not owner_mentioned) or addressed_to_others
+
+    # Общий контекст для всех вызовов classify в этом разборе: тред, недавний
+    # хвост канала, вложения. Собран один раз, чтобы повторный разбор (пустой
+    # ответ, обогащение Jira) не разъезжался с первым.
+    ctx = dict(
+        text=text,
+        author=author,
+        channel_name=channel_name(channel),
+        owner_mentioned=owner_mentioned,
+        thread_replies=replies,
+        thread_excerpt=thread_excerpt,
+        owner_replied_in_thread=owner_replied,
+        audience="owner" if held else "channel",
+        media=media,
+        channel_recent=channel_recent,
+        owner_spoke_recently=owner_spoke_recently,
+        addressed_to=addressed_names,
+    )
 
     try:
-        verdict = classifier.classify(
-            text=text,
-            author=author,
-            channel_name=channel_name(channel),
-            owner_mentioned=owner_mentioned,
-            thread_replies=replies,
-            thread_excerpt=thread_excerpt,
-            owner_replied_in_thread=owner_replied,
-            audience="owner" if held else "channel",
-            media=media,
-        )
+        verdict = classifier.classify(**ctx)
     except classifier.RateLimited as limit:
         # Не ошибка, а решение: квота дороже одной карточки. Сообщение
         # остаётся неразобранным и без метки — добор при следующем старте
@@ -656,17 +703,7 @@ def process_channel_message(event: dict) -> None:
     if cls in classifier.ACTIONABLE and not verdict["reply"].strip():
         log.warning("%s без текста ответа — пробую ещё раз", cls)
         try:
-            verdict = classifier.classify(
-                text=text,
-                author=author,
-                channel_name=channel_name(channel),
-                owner_mentioned=owner_mentioned,
-                thread_replies=replies,
-                thread_excerpt=thread_excerpt,
-                owner_replied_in_thread=owner_replied,
-                audience="owner" if held else "channel",
-                media=media,
-            )
+            verdict = classifier.classify(**ctx)
             cls = verdict["cls"]
         except Exception:
             log.exception("повторный разбор")
@@ -718,6 +755,12 @@ def process_channel_message(event: dict) -> None:
 
     if cls not in classifier.ACTIONABLE:
         remember("класс не требует ответа")
+        return
+    if addressed_to_others and cls not in ("BUG", "TASK"):
+        # Вопрос к конкретным людям — ответят они. Баг или задача, тегнутые
+        # разработчику, всё же полезны владельцу как черновик тикета, и они
+        # уходят ему в личку (held), но в тред — никогда.
+        remember(f"адресовано {addressed_names} — не моё")
         return
     if not verdict["reply"].strip():
         remember("модель не дала текста ответа даже со второй попытки")
